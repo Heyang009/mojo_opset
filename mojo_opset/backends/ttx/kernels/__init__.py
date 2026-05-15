@@ -39,6 +39,7 @@ static_quant_impl = _get_kernel_impl(ttx_backend_module, "static_quant_impl")
 lightning_indexer_impl = _get_kernel_impl(ttx_backend_module, "lightning_indexer_impl")
 dequant_impl = _get_kernel_impl(ttx_backend_module, "dequant_impl")
 sals_indexer_impl = _get_kernel_impl(ttx_backend_module, "sals_indexer_impl")
+sals_sfa_impl = _get_kernel_impl(ttx_backend_module, "sals_sfa_impl")
 
 rot_pos_embed_impl = _get_kernel_impl(ttx_backend_module, "rot_pos_embed_impl")
 rope_fwd_impl = _get_kernel_impl(ttx_backend_module, "rope_fwd_impl")

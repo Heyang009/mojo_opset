@@ -97,6 +97,7 @@ from .operators.mlp import MojoSwiGLUMLP
 
 """ indexer """
 from .operators.indexer import MojoSALSIndexer
+from .operators.sfa import MojoSALSSFA
 
 """ functions """
 from .functions.activation import MojoSiluFunction
@@ -189,6 +190,7 @@ __all__ = [
     "MojoCausalConv1dFunction",
 
     "MojoSALSIndexer",
+    "MojoSALSSFA",
 
     "MojoFusedLinearCrossEntropyLoss",
 
