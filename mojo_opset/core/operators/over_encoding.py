@@ -58,25 +58,6 @@ def n_gram_impl_torch(
         n_gram_ids.append(n_gram_id)
     n_gram_ids_tensor = torch.stack(n_gram_ids, dim=-1)
 
-
-    # reference_output = n_gram_impl_torch_ref(
-    #     input_ids,
-    #     oe_history_inputs,
-    #     oe_vocab_sizes,
-    #     oe_vocab_offset,
-    #     n_grams,
-    #     ori_vocab_size,
-    # )
-    # if not torch.equal(n_gram_ids_tensor, reference_output):
-    #     torch.save({
-    #         "input_ids": input_ids,
-    #         "oe_history_inputs": oe_history_inputs,
-    #         "oe_vocab_sizes": oe_vocab_sizes,
-    #         "oe_vocab_offset": oe_vocab_offset,
-    #         "n_grams": n_grams,
-    #         "ori_vocab_size": ori_vocab_size,
-    #     }, "n_gram_impl_torch_ref.pt")
-    #     raise ValueError("n_gram_impl_torch output_tensor is not equal to reference_output")
     return n_gram_ids_tensor
 
 def n_gram_impl_torch_ref(
