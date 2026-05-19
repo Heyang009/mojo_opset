@@ -2418,8 +2418,11 @@ class MojoPagedPrefillSageGQA(MojoOperator):
     def forward(
         self,
         query: torch.Tensor,
+        quert_scale: Optional[torch.Tensor] = None,
         key_cache: torch.Tensor,
+        key_scale: torch.Tensor = None,
         value_cache: torch.Tensor,
+        value_scale: torch.Tensor = None,
         cu_q_lens: torch.Tensor,
         block_tables: torch.Tensor,
         softmax_scale: Optional[float] = None,
@@ -2429,12 +2432,15 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         max_total_seq_lens: Optional[int] = None,
     ) -> Tuple[Any]:
         """
-        Paged prefill attention with grouped query heads (GQA) using a blocked KV cache.
+        Paged prefill sage attention with grouped query heads (GQA) using a blocked KV cache.
 
         Args:
             query (torch.Tensor): Query tokens of shape (T, Hq, D).
+            query_scale (torch.Tensor): if using dynamic quant it should be None, otherwise its shape is (T, Hq) with dtype fp32.
             key_cache (torch.Tensor): Key cache of shape (N_blocks, Hkv, block_size, D).
+            key_scale (torch.Tensor): Key scale for quant, should be None if using dynamic quant, otherwise shape is (N_blocks, Hkv, block_size) with dtype fp32.
             value_cache (torch.Tensor): Value cache of shape (N_blocks, Hkv, block_size, D).
+            value_scale (torch.Tensor): Value scale for quant, should be None if using dynamic quant, otherwise shape is [Hkv, D] with dtype fp32.
             cu_q_lens (torch.Tensor): Cumulative query lengths, shape (B+1,);
                 `cu_q_lens[i]` is the start offset for query at batch i; `cu_q_lens[-1] == T`.
             block_tables (torch.Tensor): Logical-to-physical block IDs per batch,
@@ -2472,8 +2478,11 @@ class MojoPagedPrefillSageGQA(MojoOperator):
 
         # apply per_token_int8 quant, quant_dim = -1
         head_dim = -1
-        query, query_scale = per_token_int8(query, quant_dims=(head_dim,), q_max=self.q_max, q_min=self.q_min)
-        key_cache, key_scale = per_token_int8(key_cache, quant_dims=(head_dim,), q_max=self.q_max, q_min=self.q_min)
+        assert query_scale is None, "dynamic Q quant, query_scale should be None"
+        assert key_scale is None, "dynamic K quant, key_scale should be None"
+        assert value_scale is not None, "static V quant, value should not be None"
+        query, query_scale = per_token_int8(x=query, scale=query_scale, quant_dims=(head_dim,), q_max=self.q_max, q_min=self.q_min)
+        key_cache, key_scale = per_token_int8(x=key_cache, scale=key_scale, quant_dims=(head_dim,), q_max=self.q_max, q_min=self.q_min)
 
         for i in range(batch_size):
             q_seq_len = q_lens[i].item()
