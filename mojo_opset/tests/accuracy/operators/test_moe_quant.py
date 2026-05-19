@@ -142,14 +142,8 @@ def _make_quant_weights(
 
 
 quant_moe_backend_cases = [
-    (16, 2, 128, 256, 16),
-    (16, 4, 128, 384, 33),
-    (24, 2, 128, 512, 65),
-    (24, 4, 256, 512, 97),
-    (32, 2, 256, 768, 129),
-    (32, 4, 256, 1024, 161),
-    (48, 2, 512, 1024, 193),
-    (48, 4, 512, 1536, 257),
+    (16, 2, 512, 1280, 33),
+    (24, 4, 512, 1280, 97),
 ]
 
 
@@ -314,7 +308,7 @@ def test_quant_experts_reference(up_weight_dtype, up_quant_group_size, down_weig
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        quant_type=torch.int8,
+        quant_dtype=torch.int8,
         up_quant_group_size=up_quant_group_size,
         up_weight_dtype=up_weight_dtype,
         down_quant_group_size=down_quant_group_size,
@@ -404,7 +398,7 @@ def test_quant_moe_reference(up_weight_dtype, up_quant_group_size, down_weight_d
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        quant_type=torch.int8,
+        quant_dtype=torch.int8,
         up_quant_group_size=up_quant_group_size,
         up_weight_dtype=up_weight_dtype,
         down_quant_group_size=down_quant_group_size,
@@ -470,7 +464,10 @@ def test_quant_moe_reference(up_weight_dtype, up_quant_group_size, down_weight_d
 
 
 @pytest.mark.parametrize("num_experts, top_k, hidden_size, intermediate_size, num_tokens", quant_moe_backend_cases)
-@pytest.mark.parametrize("weight_dtype,quant_group_size", [("int4", 128), (torch.int8, -1)])
+@pytest.mark.parametrize(
+    "up_weight_dtype,up_quant_group_size,down_weight_dtype,down_quant_group_size",
+    [("int4", 512, "int4", 320), (torch.int8, -1, torch.int8, -1)],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @auto_switch_platform()
 @bypass_not_implemented
@@ -480,8 +477,10 @@ def test_quant_moe_backend(
     hidden_size,
     intermediate_size,
     num_tokens,
-    weight_dtype,
-    quant_group_size,
+    up_weight_dtype,
+    up_quant_group_size,
+    down_weight_dtype,
+    down_quant_group_size,
     dtype,
 ):
     device = get_torch_device()
@@ -493,8 +492,10 @@ def test_quant_moe_backend(
         num_experts,
         hidden_size,
         intermediate_size,
-        quant_group_size,
-        weight_dtype,
+        up_quant_group_size,
+        up_weight_dtype,
+        down_quant_group_size,
+        down_weight_dtype,
     )
 
     state_dict = {
@@ -512,18 +513,22 @@ def test_quant_moe_backend(
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        quant_type=torch.int8,
-        quant_group_size=quant_group_size,
-        weight_dtype=weight_dtype,
+        quant_dtype=torch.int8,
+        up_quant_group_size=up_quant_group_size,
+        up_weight_dtype=up_weight_dtype,
+        down_quant_group_size=down_quant_group_size,
+        down_weight_dtype=down_weight_dtype,
     ).to(device)
     op_ref = MojoQuantMoE._registry.get("torch")(
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        quant_type=torch.int8,
-        quant_group_size=quant_group_size,
-        weight_dtype=weight_dtype,
+        quant_dtype=torch.int8,
+        up_quant_group_size=up_quant_group_size,
+        up_weight_dtype=up_weight_dtype,
+        down_quant_group_size=down_quant_group_size,
+        down_weight_dtype=down_weight_dtype,
     ).to(device)
     op.load_state_dict(state_dict)
     op_ref.load_state_dict({k: v.clone() for k, v in state_dict.items()})

@@ -76,8 +76,10 @@ class MojoQuantMoE(MojoOperator):
         intermediate_size=None,
         activation: str = "swiglu",
         quant_dtype: torch.dtype = torch.int8,
-        quant_group_size: int = -1,
-        weight_dtype: Union[torch.dtype, str] = torch.int8,
+        up_quant_group_size: int = -1,
+        up_weight_dtype: Union[torch.dtype, str] = torch.int8,
+        down_quant_group_size: int = -1,
+        down_weight_dtype: Union[torch.dtype, str] = torch.int8,
         **kwargs,
     ):
         super().__init__()
@@ -85,8 +87,8 @@ class MojoQuantMoE(MojoOperator):
             raise NotImplementedError(f"MojoQuantMoE: Activation {activation} is not supported.")
         if quant_dtype != torch.int8:
             raise NotImplementedError(f"MojoQuantMoE: quant_dtype must be 'int8', got {quant_dtype}.")
-        if weight_dtype not in ("int4", torch.int8):
-            raise ValueError(f"MojoQuantMoE: weight must be w4 or w8")
+        if up_weight_dtype not in ("int4", torch.int8) or down_weight_dtype not in ("int4", torch.int8):
+            raise ValueError("MojoQuantMoE: weight must be w4 or w8")
         for k in ("ep_rank", "ep_size"):
             if k in kwargs:
                 raise ValueError(f"MojoQuantMoE: {k} is not supported; use ParallelStyle to set expert partition.")
@@ -99,8 +101,10 @@ class MojoQuantMoE(MojoOperator):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.quant_dtype = quant_dtype
-        self.quant_group_size = quant_group_size
-        self.weight_dtype = weight_dtype
+        self.up_quant_group_size = up_quant_group_size
+        self.up_weight_dtype = up_weight_dtype
+        self.down_quant_group_size = down_quant_group_size
+        self.down_weight_dtype = down_weight_dtype
 
         self.gating = MojoMoEGating._registry.get(self._backend)(
             hidden_size=self.hidden_size,
@@ -115,8 +119,10 @@ class MojoQuantMoE(MojoOperator):
             intermediate_size=self.intermediate_size,
             activation=activation,
             quant_dtype=quant_dtype,
-            quant_group_size=quant_group_size,
-            weight_dtype=weight_dtype,
+            up_quant_group_size=up_quant_group_size,
+            up_weight_dtype=up_weight_dtype,
+            down_quant_group_size=down_quant_group_size,
+            down_weight_dtype=down_weight_dtype,
             **kwargs,
         )
         self.combine = MojoMoECombine._registry.get(self._backend)(multiply_by_gates=True, **kwargs)
