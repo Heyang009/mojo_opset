@@ -32,7 +32,6 @@ from .operators.attention import MojoPrefillMLA
 from .operators.attention import MojoPrefillNSA
 from .operators.attention import MojoSdpa
 from .operators.attention import MojoSWA
-from .operators.attention import MojoPrefillSageGQA
 from .operators.attention import MojoPagedPrefillSageGQA
 from .operators.attention import MojoPagedDecodeGQAWithKVDequant
 from .operators.attention import MojoPagedPrefillGQAWithKVDequant
@@ -145,7 +144,6 @@ __all__ = [
     "MojoRotateActivation",
 
     "MojoPrefillGQA",
-    "MojoPrefillSageGQA",
     "MojoPagedPrefillGQA",
     "MojoPagedPrefillSageGQA",
     "MojoPrefillMLA",
