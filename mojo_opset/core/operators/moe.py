@@ -76,9 +76,9 @@ class MojoQuantMoE(MojoOperator):
         intermediate_size=None,
         activation: str = "swiglu",
         quant_dtype: torch.dtype = torch.int8,
-        quant_group_size: int = -1,
-        fc1_quant_group_size: Optional[int] = None,
-        fc2_quant_group_size: Optional[int] = None,
+        fc1_quant_group_size: int = -1,
+        fc2_quant_group_size: int = -1,
+        fc1_only: bool = False,
         weight_dtype: Union[torch.dtype, str] = torch.int8,
         **kwargs,
     ):
@@ -101,9 +101,9 @@ class MojoQuantMoE(MojoOperator):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.quant_dtype = quant_dtype
-        self.quant_group_size = quant_group_size
-        self.fc1_quant_group_size = quant_group_size if fc1_quant_group_size is None else fc1_quant_group_size
-        self.fc2_quant_group_size = quant_group_size if fc2_quant_group_size is None else fc2_quant_group_size
+        self.fc1_quant_group_size = fc1_quant_group_size
+        self.fc2_quant_group_size = fc2_quant_group_size
+        self.fc1_only = fc1_only
         self.weight_dtype = weight_dtype
 
         self.gating = MojoMoEGating._registry.get(self._backend)(
@@ -119,9 +119,9 @@ class MojoQuantMoE(MojoOperator):
             intermediate_size=self.intermediate_size,
             activation=activation,
             quant_dtype=quant_dtype,
-            quant_group_size=quant_group_size,
             fc1_quant_group_size=self.fc1_quant_group_size,
             fc2_quant_group_size=self.fc2_quant_group_size,
+            fc1_only=self.fc1_only,
             weight_dtype=weight_dtype,
             **kwargs,
         )
@@ -306,9 +306,9 @@ class MojoQuantExperts(MojoOperator):
         intermediate_size: int,
         activation: str = "swiglu",
         quant_dtype: torch.dtype = torch.int8,
-        quant_group_size: int = -1,
-        fc1_quant_group_size: Optional[int] = None,
-        fc2_quant_group_size: Optional[int] = None,
+        fc1_quant_group_size: int = -1,
+        fc2_quant_group_size: int = -1,
+        fc1_only: bool = False,
         weight_dtype: Union[torch.dtype, str] = torch.int8,
         **kwargs,
     ):
@@ -336,9 +336,9 @@ class MojoQuantExperts(MojoOperator):
         
         self.activation = activation
         self.quant_dtype = quant_dtype
-        self.quant_group_size = quant_group_size
-        self.fc1_quant_group_size = quant_group_size if fc1_quant_group_size is None else fc1_quant_group_size
-        self.fc2_quant_group_size = quant_group_size if fc2_quant_group_size is None else fc2_quant_group_size
+        self.fc1_quant_group_size = fc1_quant_group_size
+        self.fc2_quant_group_size = fc2_quant_group_size
+        self.fc1_only = fc1_only
         self.weight_dtype = weight_dtype
         assert quant_dtype == torch.int8
         bits = 8
@@ -352,18 +352,17 @@ class MojoQuantExperts(MojoOperator):
             num_experts, hidden_size,
         )
 
-        self.down_proj_quantize = MojoMoEDynamicQuant._registry.get(self._backend)(
-            num_experts, intermediate_size,
-        )
+        if self.fc1_only:
+            self.register_module("down_proj_quantize", None)
+        else:
+            self.down_proj_quantize = MojoMoEDynamicQuant._registry.get(self._backend)(
+                num_experts, intermediate_size,
+            )
 
         if weight_dtype == torch.int8:
             self.register_buffer(
                 "up_proj_weight",
                 torch.empty((num_experts, intermediate_size * 2, hidden_size), dtype=torch.int8),
-            )
-            self.register_buffer(
-                "down_proj_weight",
-                torch.empty((num_experts, hidden_size, intermediate_size), dtype=torch.int8),
             )
         else:
             assert weight_dtype == "int4"
@@ -371,6 +370,18 @@ class MojoQuantExperts(MojoOperator):
                 "up_proj_weight",
                 torch.empty((num_experts, intermediate_size * 2 // 2, hidden_size), dtype=torch.int8),
             )
+
+        if self.fc1_only:
+            self.down_proj_weight = nn.Parameter(
+                torch.empty((num_experts, hidden_size, intermediate_size), **self.tensor_factory_kwargs)
+            )
+        elif weight_dtype == torch.int8:
+            self.register_buffer(
+                "down_proj_weight",
+                torch.empty((num_experts, hidden_size, intermediate_size), dtype=torch.int8),
+            )
+        else:
+            assert weight_dtype == "int4"
             self.register_buffer(
                 "down_proj_weight",
                 torch.empty((num_experts, hidden_size // 2, intermediate_size), dtype=torch.int8),
@@ -392,7 +403,9 @@ class MojoQuantExperts(MojoOperator):
                 ),
             )
 
-        if self.fc2_quant_group_size > 0:
+        if self.fc1_only:
+            self.register_parameter("down_proj_weight_scale", None)
+        elif self.fc2_quant_group_size > 0:
             down_proj_groups = (intermediate_size + self.fc2_quant_group_size - 1) // self.fc2_quant_group_size
             self.down_proj_weight_scale = nn.Parameter(
                 torch.empty(
@@ -481,34 +494,51 @@ class MojoQuantExperts(MojoOperator):
             activated_outs.append(F.silu(gate_proj) * up_proj)
         activated = torch.cat(activated_outs, dim=0)
 
-        y_int8, y_scale = self.down_proj_quantize(activated, tokens_per_expert)
-        y_int8_list = torch.split(y_int8, tokens_per_expert.tolist(), dim=0)
-        y_scale_list = torch.split(y_scale, tokens_per_expert.tolist(), dim=0)
         outputs = []
-        for expert_idx in range(num_experts):
-            y_int8_i = y_int8_list[expert_idx]
-            y_scale_i = y_scale_list[expert_idx]
-            if y_int8_i.shape[0] == 0:
-                outputs.append(torch.empty(0, self.hidden_size, device=sorted_hidden_states.device, dtype=sorted_hidden_states.dtype))
-                continue
+        if self.fc1_only:
+            activated_list = torch.split(activated, tokens_per_expert.tolist(), dim=0)
+            for expert_idx in range(num_experts):
+                activated_i = activated_list[expert_idx]
+                if activated_i.shape[0] == 0:
+                    outputs.append(
+                        torch.empty(
+                            0,
+                            self.hidden_size,
+                            device=sorted_hidden_states.device,
+                            dtype=sorted_hidden_states.dtype,
+                        )
+                    )
+                    continue
+                fc2_out = F.linear(activated_i.float(), self.down_proj_weight[expert_idx].float())
+                outputs.append(fc2_out.to(sorted_hidden_states.dtype))
+        else:
+            y_int8, y_scale = self.down_proj_quantize(activated, tokens_per_expert)
+            y_int8_list = torch.split(y_int8, tokens_per_expert.tolist(), dim=0)
+            y_scale_list = torch.split(y_scale, tokens_per_expert.tolist(), dim=0)
+            for expert_idx in range(num_experts):
+                y_int8_i = y_int8_list[expert_idx]
+                y_scale_i = y_scale_list[expert_idx]
+                if y_int8_i.shape[0] == 0:
+                    outputs.append(torch.empty(0, self.hidden_size, device=sorted_hidden_states.device, dtype=sorted_hidden_states.dtype))
+                    continue
 
-            fc2_out = self._quant_linear(
-                y_int8_i,
-                y_scale_i,
-                self.down_proj_weight[expert_idx],
-                self.down_proj_weight_scale[expert_idx],
-                self.fc2_quant_group_size,
-                sorted_hidden_states.dtype,
-            )
-            outputs.append(fc2_out)
+                fc2_out = self._quant_linear(
+                    y_int8_i,
+                    y_scale_i,
+                    self.down_proj_weight[expert_idx],
+                    self.down_proj_weight_scale[expert_idx],
+                    self.fc2_quant_group_size,
+                    sorted_hidden_states.dtype,
+                )
+                outputs.append(fc2_out)
 
         return torch.cat(outputs, dim=0)
 
     def extra_repr(self) -> str:
         return (
             f"{self.num_experts=}, {self.intermediate_size=}, {self.hidden_size=}, "
-            f"{self.quant_dtype=}, {self.quant_group_size=}, {self.fc1_quant_group_size=}, "
-            f"{self.fc2_quant_group_size=}, {self.weight_dtype=}"
+            f"{self.quant_dtype=}, {self.fc1_quant_group_size=}, {self.fc2_quant_group_size=}, "
+            f"{self.fc1_only=}, {self.weight_dtype=}"
         ).replace("self.", "")
 
 

@@ -90,37 +90,48 @@ def _ep_partition_fn(src_data_rank, name, module, device_mesh):
             "up_proj_weight",
             shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.up_proj_weight),
         )
-        module.register_buffer(
-            "down_proj_weight",
-            shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_weight),
-        )
+        if isinstance(module.down_proj_weight, nn.Parameter):
+            module.register_parameter(
+                "down_proj_weight",
+                nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_weight)),
+            )
+        else:
+            module.register_buffer(
+                "down_proj_weight",
+                shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_weight),
+            )
         module.register_parameter(
             "up_proj_weight_scale",
             nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.up_proj_weight_scale)),
         )
-        module.register_parameter(
-            "down_proj_weight_scale",
-            nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_weight_scale)),
-        )
+        state_dict_keys = [
+            "up_proj_weight",
+            "down_proj_weight",
+            "up_proj_weight_scale",
+        ]
+        if module.down_proj_weight_scale is not None:
+            module.register_parameter(
+                "down_proj_weight_scale",
+                nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_weight_scale)),
+            )
+            state_dict_keys.append("down_proj_weight_scale")
         module.up_proj_quantize.register_parameter(
             "inv_smooth_scale",
             nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.up_proj_quantize.inv_smooth_scale)),
         )
-        module.down_proj_quantize.register_parameter(
-            "inv_smooth_scale",
-            nn.Parameter(shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_quantize.inv_smooth_scale)),
-        )
+        state_dict_keys.append("up_proj_quantize.inv_smooth_scale")
+        if module.down_proj_quantize is not None:
+            module.down_proj_quantize.register_parameter(
+                "inv_smooth_scale",
+                nn.Parameter(
+                    shard_tensor(device_mesh, [Shard(0)], src_data_rank, module.down_proj_quantize.inv_smooth_scale)
+                ),
+            )
+            state_dict_keys.append("down_proj_quantize.inv_smooth_scale")
         module.register_state_dict_post_hook(
             partial(
                 stat_dict_rename_hook,
-                (
-                    "up_proj_weight",
-                    "down_proj_weight",
-                    "up_proj_weight_scale",
-                    "down_proj_weight_scale",
-                    "up_proj_quantize.inv_smooth_scale",
-                    "down_proj_quantize.inv_smooth_scale",
-                ),
+                tuple(state_dict_keys),
                 device_mesh,
             )
         )

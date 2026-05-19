@@ -154,9 +154,9 @@ class IxformerQuantExperts(MojoQuantExperts):
                  intermediate_size: int,
                  activation: str = "swiglu",
                  quant_dtype: torch.dtype = torch.int8,
-                 quant_group_size: int = -1,
-                 fc1_quant_group_size: Optional[int] = None,
-                 fc2_quant_group_size: Optional[int] = None,
+                 fc1_quant_group_size: int = -1,
+                 fc2_quant_group_size: int = -1,
+                 fc1_only: bool = False,
                  weight_dtype: Union[str, torch.dtype] = torch.int8,
                  **kwargs):
         super().__init__(
@@ -165,12 +165,15 @@ class IxformerQuantExperts(MojoQuantExperts):
             intermediate_size,
             activation,
             quant_dtype,
-            quant_group_size,
             fc1_quant_group_size,
             fc2_quant_group_size,
+            fc1_only,
             weight_dtype,
             **kwargs,
         )
+
+        if self.fc1_only:
+            raise NotImplementedError("IxformerQuantExperts does not support fc1_only=True.")
         
         if self.weight_dtype == torch.int8:
             if self.fc1_quant_group_size != -1 or self.fc2_quant_group_size != -1:
@@ -360,9 +363,9 @@ class IxformerQuantMoE(MojoQuantMoE):
         intermediate_size=None,
         activation: str = "swiglu",
         quant_dtype: torch.dtype = torch.int8,
-        quant_group_size: int = -1,
-        fc1_quant_group_size: int | None = None,
-        fc2_quant_group_size: int | None = None,
+        fc1_quant_group_size: int = -1,
+        fc2_quant_group_size: int = -1,
+        fc1_only: bool = False,
         weight_dtype: Union[torch.dtype, str] = torch.int8,
         **kwargs
     ):
@@ -373,12 +376,15 @@ class IxformerQuantMoE(MojoQuantMoE):
             intermediate_size,
             activation,
             quant_dtype,
-            quant_group_size,
             fc1_quant_group_size,
             fc2_quant_group_size,
+            fc1_only,
             weight_dtype,
             **kwargs,
         )
+
+        if self.fc1_only:
+            raise NotImplementedError("IxformerQuantMoE does not support fc1_only=True.")
         
         if self.weight_dtype == "int4" and (
             self.fc1_quant_group_size not in [128, 256, 320, 512]
