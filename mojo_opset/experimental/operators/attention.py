@@ -1757,8 +1757,8 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         assert query_scale is None, "dynamic Q quant, query_scale should be None"
         assert key_scale is None, "dynamic K quant, key_scale should be None"
         # assert value_scale is not None, "static V quant, value should not be None"
-        query, query_scale = per_token_int8(x=query, scale=query_scale, q_max=self.q_max, q_min=self.q_min)
-        key_cache, key_scale = per_token_int8(x=key_cache, scale=key_scale, q_max=self.q_max, q_min=self.q_min)
+        query, query_scale = per_token_int8(x=query, scale=query_scale, q_max=self.qmax, q_min=self.qmin)
+        key_cache, key_scale = per_token_int8(x=key_cache, scale=key_scale, q_max=self.qmax, q_min=self.qmin)
 
         for i in range(batch_size):
             q_seq_len = q_lens[i].item()
@@ -1829,14 +1829,14 @@ class MojoPagedPrefillSageGQA(MojoOperator):
                 attn_scores.masked_fill_(~attn_mask.unsqueeze(1), -torch.inf)
 
             attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-            attn_probs_int8, attn_probs_scale = per_token_int8(x=attn_probs, q_max=self.q_max, q_min=self.q_min)
-            v_expanded_int8, v_expanded_scale = per_channel_int8(x=v_expanded, seq_dim=-2, q_max=self.q_max, q_min=self.q_min)
+            attn_probs_int8, attn_probs_scale = per_token_int8(x=attn_probs, q_max=self.qmax, q_min=self.qmin)
+            v_expanded_int8, v_expanded_scale = per_channel_int8(x=v_expanded, seq_dim=-2, q_max=self.qmax, q_min=self.qmin)
             attn_probs_int8, v_expanded_int8 = attn_probs_int8.float(), v_expanded_int8.float()
             outputs[start_loc:end_loc] = torch.einsum("thk,khd->thd", attn_probs_int8, v_expanded_int8) * attn_probs_scale * v_expanded_scale
         return outputs
 
     def extra_repr(self) -> str:
-        return f"{self.is_causal=}, {self.gqa_layout=}, {self.query_dtype=}, {self.context_dtype=}, {self.compute_dtype=}, {self.q_max=}, {self.q_min=}".replace("self.", "")
+        return f"{self.is_causal=}, {self.gqa_layout=}, {self.query_dtype=}, {self.context_dtype=}, {self.compute_dtype=}, {self.qmax=}, {self.qmin=}".replace("self.", "")
 
 
 __all__ = [
