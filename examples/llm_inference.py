@@ -163,13 +163,13 @@ class DeepseekV4DecodeWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids, past_key_values, position_ids, context_lens, decode_attn_inputs):
+    def forward(self, input_ids, past_key_values, position_ids, context_lens, attn_inputs):
         logits, past_key_values = self.model(
             input_ids,
             past_key_values=past_key_values,
             position_ids=position_ids,
             context_lens=context_lens,
-            decode_attn_inputs=decode_attn_inputs,
+            attn_inputs=attn_inputs,
             use_cache=True,
             is_prefill=False,
         )
@@ -223,22 +223,47 @@ def compile_deepseek_v4_decode(model, graph_mode):
     raise ValueError(f"Unsupported graph_mode: {graph_mode}")
 
 
-def forward_prefill_mojo(model, input_ids, attention_mask, lengths):
-    outputs = model(input_ids, attention_mask=attention_mask, use_cache=True, is_prefill=True)
+def forward_prefill_mojo(model, input_ids, attention_mask, lengths, runtime_state=None):
+    if runtime_state is not None:
+        prefill_meta = runtime_state.prepare_prefill_inputs(input_ids, attention_mask=attention_mask, q_lens=None)
+        outputs = model(
+            input_ids=prefill_meta["input_ids"],
+            attention_mask=attention_mask,
+            position_ids=prefill_meta["position_ids"],
+            past_key_values=runtime_state.paged_cache,
+            use_cache=True,
+            is_prefill=True,
+            attn_inputs=prefill_meta["attn_inputs"],
+            context_lens=prefill_meta["context_lens"],
+            q_lens=prefill_meta["q_lens"],
+        )
+    else:
+        outputs = model(input_ids, attention_mask=attention_mask, use_cache=True, is_prefill=True)
     logits, past_key_values = _extract_outputs(outputs)
     return last_logits_from_output(logits, lengths), past_key_values
 
 
 def forward_decode_mojo(model, token_ids, past_key_values, decode_fn=None, runtime_state=None):
-    if decode_fn is not None and runtime_state is not None:
+    if runtime_state is not None:
         decode_meta = runtime_state.prepare_decode_inputs(token_ids)
-        outputs = decode_fn(
-            token_ids,
-            past_key_values,
-            decode_meta["position_ids"],
-            decode_meta["context_lens"],
-            decode_meta["decode_attn_inputs"],
-        )
+        if decode_fn is not None:
+            outputs = decode_fn(
+                token_ids,
+                past_key_values,
+                decode_meta["position_ids"],
+                decode_meta["context_lens"],
+                decode_meta["attn_inputs"],
+            )
+        else:
+            outputs = model(
+                token_ids,
+                past_key_values=past_key_values,
+                position_ids=decode_meta["position_ids"],
+                context_lens=decode_meta["context_lens"],
+                attn_inputs=decode_meta["attn_inputs"],
+                use_cache=True,
+                is_prefill=False,
+            )
         runtime_state.post_decode_step(seq_len=token_ids.shape[1])
     else:
         outputs = model(token_ids, past_key_values=past_key_values, use_cache=True, is_prefill=False)
@@ -285,21 +310,29 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_
 
     torch.npu.reset_peak_memory_stats()
     _mem_snapshot("before prefill (peak reset)")
-    with torch.no_grad():
-        next_token_logits, past_key_values = forward_prefill_mojo(model, input_ids, attention_mask, lengths)
-    _mem_snapshot("after prefill")
 
     runtime_state = None
     decode_fn = None
-    if graph_mode != "eager" and model.__class__.__name__ == "DeepseekV4ForCausalLM":
-        runtime_state = DeepseekSparseAttentionRuntimeState(past_key_values, model.config)
+    if model.__class__.__name__ == "DeepseekV4ForCausalLM":
+        runtime_state = DeepseekSparseAttentionRuntimeState.from_model(
+            model, batch_size=batch_size,
+            max_seq_len=max(input_ids.shape[1] * 4, 4096),
+        )
         if is_main:
-            print("[GRAPH] DeepseekSparseAttentionRuntimeState created for graph-compiled decode")
-            print(f"[GRAPH] Compiling decode with {graph_mode} backend...")
-        compile_t0 = time.time()
-        decode_fn = compile_deepseek_v4_decode(model, graph_mode)
-        if is_main:
-            print(f"[GRAPH] torch.compile() wrapped in {time.time() - compile_t0:.2f}s (lazy, actual compile on first call)")
+            print("[RUNTIME] DeepseekSparseAttentionRuntimeState created before prefill")
+        if graph_mode != "eager":
+            if is_main:
+                print(f"[GRAPH] Compiling decode with {graph_mode} backend...")
+            compile_t0 = time.time()
+            decode_fn = compile_deepseek_v4_decode(model, graph_mode)
+            if is_main:
+                print(f"[GRAPH] torch.compile() wrapped in {time.time() - compile_t0:.2f}s (lazy, actual compile on first call)")
+
+    with torch.no_grad():
+        next_token_logits, past_key_values = forward_prefill_mojo(
+            model, input_ids, attention_mask, lengths, runtime_state=runtime_state,
+        )
+    _mem_snapshot("after prefill")
 
     next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 

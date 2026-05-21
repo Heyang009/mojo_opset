@@ -334,7 +334,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
 
         if q_lens is None:
             if attention_mask is not None:
-                q_lens = attention_mask.to(device=device, dtype=torch.int32).sum(dim=-1)
+                q_lens = attention_mask.to(device=device, dtype=torch.int32).sum(dim=-1).to(dtype=torch.int32)
             else:
                 q_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
 
@@ -346,10 +346,43 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             past_len = int(context_lens.max().item()) if context_lens.numel() > 0 else 0
             position_ids = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long).unsqueeze(0)
 
-        cu_q_lens = torch.cat([
-            torch.tensor([0], device=device, dtype=torch.int32),
-            q_lens.cumsum(0, dtype=torch.int32),
-        ])
+        cu_q_lens = torch.arange(
+            0, (batch_size + 1) * seq_len, step=seq_len,
+            dtype=torch.int32, device=device,
+        )
+
+        start_pos = context_lens.to(dtype=torch.int32)
+        seq_used_q = q_lens
+        current_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+
+        unique_ratios = sorted(set(
+            self.config.compress_ratios[l] if l < len(self.config.compress_ratios) else 0
+            for l in range(pkv.num_layers)
+        ))
+        shared_metadata = {}
+        for ratio in unique_ratios:
+            attn_ratio = ratio if ratio > 1 else 1
+            sas_meta = self._compute_sas_metadata(cu_q_lens, current_seq_lens, batch_size, attn_ratio)
+            shared_metadata[ratio] = {"sas_metadata": sas_meta}
+            if ratio > 1:
+                compressed_len, position_ids_cmp = pkv.get_compressed_position_ids(
+                    start_pos, seq_used_q, cu_q_lens, ratio,
+                )
+                cmp_rope_position_ids = (position_ids_cmp * ratio).to(dtype=torch.long).unsqueeze(0)
+                shared_metadata[ratio].update({
+                    "compressed_len": compressed_len,
+                    "position_ids_cmp": position_ids_cmp,
+                    "cmp_rope_position_ids": cmp_rope_position_ids,
+                })
+
+        attn_inputs = {}
+        for layer_idx in range(pkv.num_layers):
+            ratio = self.config.compress_ratios[layer_idx] if layer_idx < len(self.config.compress_ratios) else 0
+            attn_inputs[layer_idx] = self._prepare_layer_prefill_inputs(
+                layer_idx, ratio, context_lens, q_lens, cu_q_lens,
+                start_pos, seq_used_q, batch_size, seq_len, device,
+                shared_metadata.get(ratio, {}),
+            )
 
         return {
             "input_ids": input_ids,
@@ -358,7 +391,74 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "context_lens": context_lens,
             "cu_q_lens": cu_q_lens,
             "q_lens": q_lens,
+            "attn_inputs": attn_inputs,
         }
+
+    def _prepare_layer_prefill_inputs(
+        self, layer_idx, ratio, context_lens, q_lens, cu_q_lens,
+        start_pos, seq_used_q, batch_size, seq_len, device,
+        shared_metadata=None,
+    ):
+        pkv = self.paged_cache
+        layer_inputs = {
+            "q_lens": q_lens,
+            "cu_q_lens": cu_q_lens,
+            "start_pos": start_pos,
+            "seq_used_q": seq_used_q,
+            "sas_metadata": shared_metadata.get("sas_metadata") if shared_metadata else None,
+        }
+        if ratio <= 1:
+            return layer_inputs
+
+        compressed_len = shared_metadata.get("compressed_len") if shared_metadata else None
+        position_ids_cmp = shared_metadata.get("position_ids_cmp") if shared_metadata else None
+        cmp_rope_position_ids = shared_metadata.get("cmp_rope_position_ids") if shared_metadata else None
+        if compressed_len is None or position_ids_cmp is None:
+            compressed_len, position_ids_cmp = pkv.get_compressed_position_ids(
+                start_pos, seq_used_q, cu_q_lens, ratio,
+            )
+            cmp_rope_position_ids = (position_ids_cmp * ratio).to(dtype=torch.long).unsqueeze(0)
+
+        cmp_slot_mapping = pkv.get_cmp_slot_mapping(
+            layer_idx, start_pos, seq_used_q,
+            cu_seqlens_q=cu_q_lens,
+            compressed_len=compressed_len,
+            position_ids_cmp=position_ids_cmp,
+        )
+
+        layer_inputs.update({
+            "sfa_state_cache": pkv.get_sfa_kv_state(layer_idx),
+            "state_block_table": pkv.get_cmp_state_block_table(layer_idx, start_pos, seq_used_q, True),
+            "cmp_slot_mapping": cmp_slot_mapping,
+            "cmp_kv_cache": pkv.get_sfa_cmp_kv(layer_idx),
+            "cmp_block_tables": pkv.get_cmp_kv_block_table(layer_idx),
+            "compressed_len": compressed_len,
+            "cmp_rope_position_ids": cmp_rope_position_ids,
+        })
+        if ratio != 4:
+            return layer_inputs
+
+        c4a_cmp_kv_block_table = pkv.get_c4a_cmp_kv_block_table(layer_idx)
+        li_metadata = shared_metadata.get("li_metadata") if shared_metadata else None
+        if li_metadata is None:
+            indexer_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+            li_metadata = self._compute_li_metadata(cu_q_lens[1:], indexer_seq_lens, c4a_cmp_kv_block_table)
+
+        layer_inputs.update({
+            "li_cmp_kv": pkv.get_li_cmp_kv(layer_idx),
+            "li_key_dequant_scale": pkv.get_li_key_dequant_scale(layer_idx),
+            "c4a_cmp_kv_block_table": c4a_cmp_kv_block_table,
+            "li_state_cache": pkv.get_li_kv_state(layer_idx),
+            "li_state_block_table": pkv.get_cmp_state_block_table(layer_idx, start_pos, seq_used_q, True),
+            "li_cmp_slot_mapping": pkv.get_cmp_slot_mapping(
+                layer_idx, start_pos, seq_used_q,
+                cu_seqlens_q=cu_q_lens,
+                compressed_len=compressed_len,
+                position_ids_cmp=position_ids_cmp,
+            ),
+            "li_metadata": li_metadata,
+        })
+        return layer_inputs
 
     def prepare_decode_inputs(self, input_ids):
         pkv = self.paged_cache
@@ -403,10 +503,10 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
                 li_meta = self._compute_li_metadata(cu_q_lens[1:], current_seq_lens, c4a_block_table)
                 shared_metadata[ratio]["li_metadata"] = li_meta
 
-        decode_attn_inputs = {}
+        attn_inputs = {}
         for layer_idx in range(pkv.num_layers):
             ratio = self.config.compress_ratios[layer_idx] if layer_idx < len(self.config.compress_ratios) else 0
-            decode_attn_inputs[layer_idx] = self._prepare_layer_decode_inputs(
+            attn_inputs[layer_idx] = self._prepare_layer_decode_inputs(
                 layer_idx, ratio, context_lens, q_lens, cu_q_lens,
                 start_pos, seq_used_q, batch_size, seq_len, device,
                 shared_metadata.get(ratio, {}), win_slot_mapping,
@@ -420,7 +520,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             "q_lens": q_lens,
             "start_pos": start_pos,
             "seq_used_q": seq_used_q,
-            "decode_attn_inputs": decode_attn_inputs,
+            "attn_inputs": attn_inputs,
         }
 
     def post_decode_step(self, seq_len=1):

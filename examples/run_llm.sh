@@ -7,7 +7,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DEFAULT_LOCAL_PATH="/data00/DeepSeek-V4-Flash-INT8"
 export MOJO_BACKEND="ascendc"
 export MOJO_GRAPH_MODE="${MOJO_GRAPH_MODE:-npugraph_ex}"
-export MOJO_PROF="0"
+export MOJO_PROF="1"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 
 export PROMPT="${PROMPT:-[\"请用一句话介绍量子计算的核心原理。\", \"在昇腾NPU平台上部署大语言模型进行推理时，需要综合考虑多个技术维度的优化策略。首先，在并行策略方面，张量并行适用于低时延场景，专家并行适用于高吞吐的MoE架构模型，数据并行则用于提升整体吞吐量。对于DeepSeek这 类MoE模型，通常采用专家并行加张量并行的混合并行策略，其中专家并行用于专家层的分布式计算，张量并行用于注意力层和共享层的切分。其次，在算子优化方面，FlashAttention可以显著降低注意力计算的显存占用和计算延迟，而融合算子则能减少算子间的访存开销和任务调度开销。第三，在显存管理方面，KVCache的优化至关重要，包括PagedAttention的块管理策略和KV缓存的量化压缩。第四，在图模式优化方面，torch.compile和GE图模式可以将动态图转换为静态图，消除Python解释器开销。第五，在多流并行方面，可以将 注意力计算和前馈网络计算分别放到不同的NPU流上执行，实现流水线重叠。第六，在权重预取方面，可以在计算当前层的同时预取下一层的权重，隐藏访存延迟。请基于以上背景 ，详细分析在昇腾NPU上部署DeepSeek模型时应该如何选择和组合这些优化技术。\"]}"
