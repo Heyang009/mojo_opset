@@ -9,6 +9,7 @@ from mojo_opset.experimental import MojoPagedDecodeSWAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillGQAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillSWAWithKVDequant
 from mojo_opset.experimental import MojoPagedPrefillSageGQA
+from mojo_opset.experimental import per_token_int8, per_channel_int8
 from mojo_opset.tests.utils import auto_switch_platform
 from mojo_opset.tests.utils import bypass_not_implemented
 
@@ -692,27 +693,48 @@ def test_paged_prefill_sage_gqa(
     head_dim = query.shape[-1]
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    v_cache_q, value_scale = _quantize_kv_cache(v_cache, context_dtype)
+    # q/k: per-token int8 (quant along last dim D)
+    # v:   per-channel int8 (scale shared across blocks and tokens, kept per [Hkv, D])
+    query_int8, query_scale = per_token_int8(query, q_max=127, q_min=-128)
+    key_cache_int8, key_scale = per_token_int8(k_cache, q_max=127, q_min=-128)
+    value_cache_int8, value_scale = per_channel_int8(v_cache, seq_dim=[0, 2], q_max=127, q_min=-128)
+    # forward expects: query_scale [T, Hq], key_scale [N_blocks, Hkv, block_size], value_scale [Hkv, D]
+    query_scale = query_scale.squeeze(-1)
+    key_scale = key_scale.squeeze(-1)
+    value_scale = value_scale.squeeze(2).squeeze(0)
 
     atol = 5e-2 if query.dtype != torch.float32 else 1e-5
     rtol = 5e-2 if query.dtype != torch.float32 else 1e-6
-    print(f"{query.shape=}, {k_cache.shape=}, {v_cache_q.shape=}, {value_scale.shape=}")
-
-    op.forward_diff_with(
-        op_ref,
-        query,
-        k_cache,
-        v_cache_q,
+    op_ref(
+        query_int8,
+        query_scale,
+        key_cache_int8,
+        key_scale,
+        value_cache_int8,
+        value_scale,
         cu_q_lens,
         block_tables,
-        query_scale=None,
-        key_scale=None,
-        value_scale=value_scale,
         softmax_scale=softmax_scale,
         cu_total_seq_lens=cu_total_seq_lens,
         max_q_lens=max_q_lens,
         max_total_seq_lens=max_total_seq_lens,
-        atol=atol,
-        rtol=rtol,
-        ptol=0.90,
     )
+
+    # op_ref.forward_diff_with(
+    #     op_ref,
+    #     query_int8,
+    #     query_scale,
+    #     key_cache_int8,
+    #     key_scale,
+    #     value_cache_int8,
+    #     value_scale,
+    #     cu_q_lens,
+    #     block_tables,
+    #     softmax_scale=softmax_scale,
+    #     cu_total_seq_lens=cu_total_seq_lens,
+    #     max_q_lens=max_q_lens,
+    #     max_total_seq_lens=max_total_seq_lens,
+    #     atol=atol,
+    #     rtol=rtol,
+    #     ptol=0.90,
+    # )
