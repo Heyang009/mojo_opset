@@ -708,9 +708,7 @@ class PagedDummyCache:
                     scale_cache[block_idx, offset, 0, 0] = k_scale[t]
 
     def get_kv_for_decode(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        max_slen = self.seq_lens[layer_idx].max().item()
-        max_blocks = (max_slen + self.block_size - 1) // self.block_size
-        return self.kv_cache, self.block_tables[layer_idx, :, :max_blocks]
+        return self.kv_cache, self.block_tables[layer_idx]
 
     def get_win_kv_for_decode(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         win_kv = self.cache_data[layer_idx]["win_kv"]
@@ -1555,8 +1553,6 @@ class DeepseekV4Attention(nn.Module):
                 full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
                 past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
         elif decode_attn_inputs is not None:
-            kv_cache = decode_attn_inputs["kv_cache"]
-            block_tables = decode_attn_inputs["block_tables"]
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 decode_attn_inputs["win_kv_cache"].view(-1, self.head_dim),
@@ -1564,10 +1560,12 @@ class DeepseekV4Attention(nn.Module):
                 kv_flat,
             )
             self.scatter_nd_update(
-                kv_cache.view(-1, self.head_dim),
+                decode_attn_inputs["kv_cache"].view(-1, self.head_dim),
                 decode_attn_inputs["kv_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
+            kv_cache = decode_attn_inputs["win_kv_cache"]
+            block_tables = decode_attn_inputs["win_block_table"]
         else:
             win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens)
             past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping)
@@ -1604,8 +1602,6 @@ class DeepseekV4Attention(nn.Module):
                 full_kv_gather_indices = past_key_values.get_full_kv_gather_indices(context_lens, q_lens)
                 past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping, full_kv_gather_indices, context_lens)
         elif decode_attn_inputs is not None:
-            kv_cache = decode_attn_inputs["kv_cache"]
-            block_tables = decode_attn_inputs["block_tables"]
             kv_flat = kv.reshape(-1, self.head_dim)
             self.scatter_nd_update(
                 decode_attn_inputs["win_kv_cache"].view(-1, self.head_dim),
@@ -1613,10 +1609,12 @@ class DeepseekV4Attention(nn.Module):
                 kv_flat,
             )
             self.scatter_nd_update(
-                kv_cache.view(-1, self.head_dim),
+                decode_attn_inputs["kv_cache"].view(-1, self.head_dim),
                 decode_attn_inputs["kv_slot_mapping"].reshape(-1, 1),
                 kv_flat,
             )
+            kv_cache = decode_attn_inputs["win_kv_cache"]
+            block_tables = decode_attn_inputs["win_block_table"]
         else:
             win_slot_mapping = past_key_values.get_win_slot_mapping(context_lens, q_lens)
             past_key_values.update_win_kv(kv, self.layer_idx, win_slot_mapping)
