@@ -705,7 +705,8 @@ def test_paged_prefill_sage_gqa(
 
     atol = 5e-2 if query.dtype != torch.float32 else 1e-5
     rtol = 5e-2 if query.dtype != torch.float32 else 1e-6
-    op_ref(
+    op_ref.forward_diff_with(
+        op_ref,
         query_int8,
         query_scale,
         key_cache_int8,
@@ -718,23 +719,7 @@ def test_paged_prefill_sage_gqa(
         cu_total_seq_lens=cu_total_seq_lens,
         max_q_lens=max_q_lens,
         max_total_seq_lens=max_total_seq_lens,
+        atol=atol,
+        rtol=rtol,
+        ptol=0.90,
     )
-
-    # op_ref.forward_diff_with(
-    #     op_ref,
-    #     query_int8,
-    #     query_scale,
-    #     key_cache_int8,
-    #     key_scale,
-    #     value_cache_int8,
-    #     value_scale,
-    #     cu_q_lens,
-    #     block_tables,
-    #     softmax_scale=softmax_scale,
-    #     cu_total_seq_lens=cu_total_seq_lens,
-    #     max_q_lens=max_q_lens,
-    #     max_total_seq_lens=max_total_seq_lens,
-    #     atol=atol,
-    #     rtol=rtol,
-    #     ptol=0.90,
-    # )
