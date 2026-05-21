@@ -4,8 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-DEFAULT_LOCAL_PATH="/data00/dpskv4-flash-quant"
-
+DEFAULT_LOCAL_PATH="/data00/DeepSeek-V4-Flash-INT8"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     echo "Python interpreter not found: ${PYTHON_BIN}"

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import logging
+import time
 from typing import List
 
 import torch
@@ -13,6 +14,7 @@ from transformers import AutoTokenizer
 
 from mojo_opset.utils.hf_utils import _resolve_local_files_only
 from mojo_opset.utils.hf_utils import build_model_from_hf
+from mojo_opset.runtime import DeepseekSparseAttentionRuntimeState
 
 ARCH_MAP = {
     "Qwen3ForCausalLM": ("mojo_opset.modeling.qwen3.mojo_qwen3_dense", "Qwen3ForCausalLM"),
@@ -156,19 +158,95 @@ def sync_next_token(next_token, model):
     return next_token
 
 
+class DeepseekV4DecodeWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, past_key_values, position_ids, context_lens, decode_attn_inputs):
+        logits, past_key_values = self.model(
+            input_ids,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            context_lens=context_lens,
+            decode_attn_inputs=decode_attn_inputs,
+            use_cache=True,
+            is_prefill=False,
+        )
+        return logits, past_key_values
+
+
+def compile_deepseek_v4_decode(model, graph_mode):
+    if graph_mode == "eager" or model.__class__.__name__ != "DeepseekV4ForCausalLM":
+        return None
+    torch._dynamo.config.inline_inbuilt_nn_modules = False
+    torch.npu.set_compile_mode(jit_compile=False)
+    torch._dynamo.config.capture_dynamic_output_shape_ops = True
+    torch._dynamo.config.cache_size_limit = 128
+    wrapper = DeepseekV4DecodeWrapper(model)
+
+    if graph_mode == "npugraph_ex":
+        graph_pool = torch.npu.graph_pool_handle()
+        compile_options = {
+            "frozen_parameter": True,
+            "static_kernel_compile": False,
+            "clone_input": False,
+            "use_graph_pool": graph_pool,
+        }
+        return torch.compile(
+            wrapper,
+            dynamic=False,
+            fullgraph=True,
+            backend="npugraph_ex",
+            options=compile_options,
+        )
+
+    if graph_mode == "ge_graph":
+        import torchair as tng
+        import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+        from torchair.configs.compiler_config import CompilerConfig
+
+        tng.patch_for_hcom()
+
+        compiler_config = CompilerConfig()
+        compiler_config.experimental_config.frozen_parameter = True
+        compiler_config.experimental_config.tiling_schedule_optimize = True
+        compiler_config.experimental_config.topology_sorting_strategy = "StableRDFS"
+        npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
+        return torch.compile(
+            wrapper,
+            dynamic=False,
+            fullgraph=True,
+            backend=npu_backend,
+        )
+
+    raise ValueError(f"Unsupported graph_mode: {graph_mode}")
+
+
 def forward_prefill_mojo(model, input_ids, attention_mask, lengths):
     outputs = model(input_ids, attention_mask=attention_mask, use_cache=True, is_prefill=True)
     logits, past_key_values = _extract_outputs(outputs)
     return last_logits_from_output(logits, lengths), past_key_values
 
 
-def forward_decode_mojo(model, token_ids, past_key_values):
-    outputs = model(token_ids, past_key_values=past_key_values, use_cache=True, is_prefill=False)
+def forward_decode_mojo(model, token_ids, past_key_values, decode_fn=None, runtime_state=None):
+    if decode_fn is not None and runtime_state is not None:
+        decode_meta = runtime_state.prepare_decode_inputs(token_ids)
+        outputs = decode_fn(
+            token_ids,
+            past_key_values,
+            decode_meta["position_ids"],
+            decode_meta["context_lens"],
+            decode_meta["decode_attn_inputs"],
+        )
+        runtime_state.post_decode_step(seq_len=token_ids.shape[1])
+    else:
+        outputs = model(token_ids, past_key_values=past_key_values, use_cache=True, is_prefill=False)
     logits, past_key_values = _extract_outputs(outputs)
     return logits[:, -1, :], past_key_values
 
 
-def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_size=1):
+def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_size=1, graph_mode="eager", prof=False):
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
@@ -202,6 +280,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_
             print(f"\n[Batch {i}] Prompt: {prompts[i]}")
             print(f"  Rendered prefix: {repr(rendered[i][:200])}")
             print(f"  Input length: {lengths[i].item()}")
+        print(f"Graph mode: {graph_mode}")
         print("-" * 40)
 
     torch.npu.reset_peak_memory_stats()
@@ -209,6 +288,18 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_
     with torch.no_grad():
         next_token_logits, past_key_values = forward_prefill_mojo(model, input_ids, attention_mask, lengths)
     _mem_snapshot("after prefill")
+
+    runtime_state = None
+    decode_fn = None
+    if graph_mode != "eager" and model.__class__.__name__ == "DeepseekV4ForCausalLM":
+        runtime_state = DeepseekSparseAttentionRuntimeState(past_key_values, model.config)
+        if is_main:
+            print("[GRAPH] DeepseekSparseAttentionRuntimeState created for graph-compiled decode")
+            print(f"[GRAPH] Compiling decode with {graph_mode} backend...")
+        compile_t0 = time.time()
+        decode_fn = compile_deepseek_v4_decode(model, graph_mode)
+        if is_main:
+            print(f"[GRAPH] torch.compile() wrapped in {time.time() - compile_t0:.2f}s (lazy, actual compile on first call)")
 
     next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
@@ -219,20 +310,66 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, batch_
 
     input_ids = next_token_id
 
-    for step in range(max_new_tokens - 1):
-        with torch.no_grad():
-            next_token_logits, past_key_values = forward_decode_mojo(model, input_ids, past_key_values)
+    warmup_steps = int(os.getenv("MOJO_PROF_WARMUP_STEPS", "3"))
+    prof_steps = int(os.getenv("MOJO_PROF_ACTIVE_STEPS", "3"))
+    prof_active = False
+    prof_ctx = None
+    try:
+        for step in range(max_new_tokens - 1):
+            if prof and step == warmup_steps and is_main:
+                import torch_npu.profiler as prof_mod
+                prof_dir = os.getenv(
+                    "MOJO_PROF_DIR",
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "profiling_decode"),
+                )
+                prof_ctx = prof_mod.profile(
+                    activities=[prof_mod.ProfilerActivity.CPU, prof_mod.ProfilerActivity.NPU],
+                    schedule=prof_mod.schedule(wait=0, warmup=0, active=prof_steps, repeat=1),
+                    on_trace_ready=prof_mod.tensorboard_trace_handler(prof_dir),
+                    record_shapes=True,
+                    with_stack=True,
+                    with_flops=True,
+                )
+                prof_ctx.__enter__()
+                prof_active = True
+                print(f"[PROF] Start profiling decode at step {step}, output -> {prof_dir}", flush=True)
 
-        next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+            with torch.no_grad():
+                next_token_logits, past_key_values = forward_decode_mojo(
+                    model, input_ids, past_key_values, decode_fn=decode_fn, runtime_state=runtime_state,
+                )
 
-        if ep_size > 1 and dist.is_initialized():
-            dist.broadcast(next_token_id, src=0, group=moe_ep_group)
+            if step == 0 and decode_fn is not None and is_main:
+                print("[GRAPH] First decode step done (compilation triggered on this step)")
+                print(
+                    f"[MEM] After graph compile: allocated={torch.npu.memory_allocated()/1e9:.2f} GB, "
+                    f"peak={torch.npu.max_memory_allocated()/1e9:.2f} GB, "
+                    f"reserved={torch.npu.memory_reserved()/1e9:.2f} GB",
+                    flush=True,
+                )
 
-        token_list = next_token_id.squeeze(-1).detach().cpu().tolist()
-        for row, token_id in enumerate(token_list):
-            generated[row].append(int(token_id))
+            if prof_active:
+                prof_ctx.step()
 
-        input_ids = next_token_id
+            if prof_active and (step - warmup_steps + 1) >= prof_steps:
+                prof_ctx.__exit__(None, None, None)
+                prof_ctx = None
+                prof_active = False
+                print(f"[PROF] Stop profiling at step {step}, collected {prof_steps} decode steps", flush=True)
+
+            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+
+            if ep_size > 1 and dist.is_initialized():
+                dist.broadcast(next_token_id, src=0, group=moe_ep_group)
+
+            token_list = next_token_id.squeeze(-1).detach().cpu().tolist()
+            for row, token_id in enumerate(token_list):
+                generated[row].append(int(token_id))
+
+            input_ids = next_token_id
+    finally:
+        if prof_ctx is not None:
+            prof_ctx.__exit__(None, None, None)
 
     _mem_snapshot("after all decode steps")
 
@@ -257,6 +394,10 @@ def parse_args():
     parser.add_argument("--ep_size", type=int, default=int(os.getenv("EP_SIZE", "1")))
     parser.add_argument("--batch_size", type=int, default=int(os.getenv("BATCH_SIZE", "1")),
                         help="Batch size for inference (default: 1, single-batch)")
+    parser.add_argument("--prof", action="store_true", default=bool(int(os.getenv("MOJO_PROF", "0"))),
+                        help="Enable NPU profiling for decode")
+    parser.add_argument("--graph_mode", type=str, default=os.getenv("MOJO_GRAPH_MODE", "eager"),
+                        choices=["eager", "npugraph_ex", "ge_graph"], help="Graph compilation mode for decode")
     return parser.parse_args()
 
 
@@ -347,7 +488,7 @@ def main():
 
     generate(
         model, tokenizer, args.prompt, args.max_new_tokens, f"npu:{npu_device_idx}",
-        ep_size=ep_size, batch_size=args.batch_size,
+        ep_size=ep_size, batch_size=args.batch_size, graph_mode=args.graph_mode, prof=args.prof,
     )
 
     if dist.is_initialized():
