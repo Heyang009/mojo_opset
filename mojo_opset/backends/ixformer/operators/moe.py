@@ -55,6 +55,9 @@ def _repack_int4_tn_to_nn(packed_tn: torch.Tensor, N: int, K: int) -> torch.Tens
 def _swizzle_weights_post_hook(module, incompatible_keys):
     """load_state_dict post-hook: convert int4/int8 weights from TN (checkpoint) to NN (ixformer) format."""
     device = module.up_proj_weight.device
+    module.up_proj_quantize.inv_smooth_scale = torch.nn.Parameter(module.up_proj_quantize.inv_smooth_scale.data.to(dtype=torch.bfloat16))
+    module.down_proj_quantize.inv_smooth_scale = torch.nn.Parameter(module.down_proj_quantize.inv_smooth_scale.data.to(dtype=torch.bfloat16))
+    
     if module.up_weight_dtype == "int4":
         N_up = module.intermediate_size * 2
         K_up = module.hidden_size
@@ -560,6 +563,14 @@ class IxformerQuantMoE(MojoQuantMoE):
             raise NotImplementedError(f"IxformerQuantMoE: hidden_states dtype must be 'torch.bfloat16' or 'torch.float16', got {hidden_states.dtype}.")
 
         top_k_indices, top_k_gates = self.gating(hidden_states)
+        
+        if hidden_states.dtype == torch.float16:
+            self.experts.up_proj_quantize.inv_smooth_scale = torch.nn.Parameter(
+                self.experts.up_proj_quantize.inv_smooth_scale.to(dtype=torch.float32)
+            )
+            self.experts.down_proj_quantize.inv_smooth_scale = torch.nn.Parameter(
+                self.experts.down_proj_quantize.inv_smooth_scale.to(dtype=torch.float32)
+            )
 
         i8_hs, sorted_token_ids, src_to_dst, tokens_per_expert, quant_scale = self.dispatch(
             hidden_states,
