@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 ENDPOINT = "https://f7xnt9mg.fn.bytedance.net"
@@ -31,11 +33,8 @@ def main() -> None:
     gh_token = env("GITHUB_TOKEN")
     proxy = os.environ.get("OUTBOUND_PROXY") or None
 
-    # Make sure base is fetched locally; on PR events checkout may not have it.
-    subprocess.run(
-        ["git", "fetch", "--no-tags", "--depth=200", "origin", base],
-        check=False,
-    )
+    # actions/checkout@v4 with fetch-depth: 0 already fetched all history,
+    # so base should be reachable locally.
     diff = subprocess.check_output(
         ["git", "diff", f"{base}...{head}"], text=True
     )
@@ -70,18 +69,38 @@ def main() -> None:
         "max_tokens": 4000,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
-    req = urllib.request.Request(
-        f"{ENDPOINT}/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "Authorization": f"Bearer {anthropic_token}",
-        },
+
+    data = None
+    last_err = None
+    for attempt in range(3):
+        req = urllib.request.Request(
+            f"{ENDPOINT}/v1/messages",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "Authorization": f"Bearer {anthropic_token}",
+            },
+        )
+        try:
+            with internal_opener.open(req, timeout=300) as resp:
+                data = json.loads(resp.read())
+            break
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            last_err = e
+            print(f"attempt {attempt + 1} failed: {e!r}", file=sys.stderr)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    if data is None:
+        sys.exit(f"LLM call failed after retries: {last_err!r}")
+
+    if data.get("type") == "error" or "content" not in data:
+        sys.exit(f"endpoint returned error payload: {data}")
+    review = "".join(
+        b.get("text", "") for b in data["content"] if b.get("type") == "text"
     )
-    with internal_opener.open(req, timeout=300) as resp:
-        data = json.loads(resp.read())
-    review = "".join(b["text"] for b in data["content"] if b["type"] == "text")
+    if not review.strip():
+        sys.exit(f"no text content in response: {data}")
     print(f"got review, {len(review)} chars")
 
     comment = f"## Claude Code Review\n\n{review}"

@@ -18,6 +18,10 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   MOJO_OPSET_PROXY: ${{ secrets.MOJO_OPSET_PROXY }}
 
@@ -25,6 +29,7 @@ jobs:
   review:
     name: Claude review
     runs-on: NPU
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Pre-cleanup workspace
         run: |
