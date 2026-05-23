@@ -1,0 +1,43 @@
+name: Claude PR Review
+on:
+  pull_request:
+    branches:
+    - master
+    - feat/*
+    - dev/*
+    - release/*
+    types: [ opened, synchronize, reopened ]
+    paths-ignore:
+    - 'CHANGELOG.md'
+    - 'README.md'
+    - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  MOJO_OPSET_PROXY: ${{ secrets.MOJO_OPSET_PROXY }}
+
+jobs:
+  review:
+    name: Claude review
+    runs-on: NPU
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude code review
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://f7xnt9mg.fn.bytedance.net
+          HTTP_PROXY: ${{ env.MOJO_OPSET_PROXY }}
+          HTTPS_PROXY: ${{ env.MOJO_OPSET_PROXY }}
+          NO_PROXY: f7xnt9mg.fn.bytedance.net,bytedpypi.byted.org,hub.byted.org,code.byted.org,localhost,127.0.0.1
+        with:
+          anthropic_api_key: internal-endpoint-auths-by-network
+          prompt: "/review"
+          claude_args: "--model claude-opus-4-7"
