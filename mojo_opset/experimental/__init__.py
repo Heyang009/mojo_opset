@@ -19,9 +19,6 @@ from .operators.attention import MojoPagedPrefillSWAWithKVDequant
 from .operators.attention import MojoPrefillMLA
 from .operators.attention import MojoPrefillNSA
 from .operators.attention import MojoPagedPrefillSageGQA
-from .operators.attention import per_block_int8
-from .operators.attention import per_channel_int8
-from .operators.attention import per_token_int8
 from .operators.gemm import MojoQuantBatchGemmReduceSum
 from .operators.indexer import MojoIndexer
 from .operators.indexer import MojoLightningIndexer
@@ -62,7 +59,4 @@ __all__ = [
     "MojoGridRoPE",
     "MojoStoreLowrank",
     "MojoIndexer",
-    "per_block_int8",
-    "per_channel_int8",
-    "per_token_int8",
 ]
