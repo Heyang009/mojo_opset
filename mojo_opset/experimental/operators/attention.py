@@ -1710,12 +1710,15 @@ class MojoPagedPrefillSageGQA(MojoOperator):
                 attn_mask = attn_mask[kv_seq_len - q_seq_len : kv_seq_len, :kv_seq_len]
                 attn_scores.masked_fill_(~attn_mask.unsqueeze(1), -torch.inf)
 
-            attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-            attn_probs_quant, attn_probs_scale = attn_probs * self.qmax, 1. / self.qmax
+            attn_scores_max = torch.max(attn_scores, dim=-1, keepdim=True).values
+            attn_scores_stable_exp = torch.exp(attn_scores - attn_scores_max)
+            attn_scores_sum = torch.sum(attn_scores_stable_exp, dim=-1, keepdim=True)
+            # quant for unnormalized attention scores
+            attn_score_safe_exp_quant, attn_score_safe_exp_scale = attn_scores_stable_exp * self.qmax, 1. / self.qmax
             v_expanded_float = v_expanded.float()
             # v_expanded_float: [kv_seq_len, Hq, D], v_scale_expanded: [1, Hq, D], attn_probs_scale: const = 1./self.qmax
             outputs[start_loc:end_loc] = (
-                torch.einsum("thk,khd->thd", attn_probs_quant.float(), v_expanded_float) * v_scale_expanded * attn_probs_scale
+                torch.einsum("thk,khd->thd", attn_score_safe_exp_quant.float(), v_expanded_float) * v_scale_expanded * attn_score_safe_exp_scale / attn_scores_sum
             )
         return outputs
 
