@@ -9,41 +9,162 @@ import triton.language as tl
 from mojo_opset.backends.ttx.kernels.npu.utils import get_num_cores
 
 
-def _expand_indices_by_group_union(
+# ---- Union-unique bitmap kernel (Triton version of _expand_indices_by_group_union) ----
+
+@triton.jit(do_not_specialize=["cumsum_q_len_len", "G", "tasks_per_prog"])
+def _union_unique_bitmap_kernel(
+    indices_flat_ptr,
+    seq_len_flat_ptr,
+    group_qid_ptr,
+    cumsum_q_len_ptr,
+    base_kv_len_ptr,
+    cumsum_q_len_len,
+    group_union_indices_ptr,
+    group_union_seq_len_ptr,
+    bitmap_ptr,
+    stride_idx_g, stride_idx_h, stride_idx_k,
+    stride_gi_g, stride_gi_k,
+    stride_bm_g, stride_bm_w,
+    G,
+    tasks_per_prog,
+    kv_heads: tl.constexpr,
+    max_sparse: tl.constexpr,
+    max_union_len: tl.constexpr,
+    sparse_block_size: tl.constexpr,
+    BITMAP_WORDS: tl.constexpr,
+    TOTAL_IDS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    for task_sub in range(tasks_per_prog):
+        g = pid * tasks_per_prog + task_sub
+        if g < G:
+            s_count = tl.load(seq_len_flat_ptr + g).to(tl.int32)
+            if s_count == 0:
+                tl.store(group_union_seq_len_ptr + g, 0)
+            else:
+                qid = tl.load(group_qid_ptr + g).to(tl.int32)
+                base_kv = tl.load(base_kv_len_ptr + qid).to(tl.int32)
+                req_start = tl.load(cumsum_q_len_ptr + qid).to(tl.int32)
+                if qid + 1 < cumsum_q_len_len:
+                    req_end = tl.load(cumsum_q_len_ptr + qid + 1).to(tl.int32)
+                else:
+                    req_end = req_start
+                total_kv_len = base_kv + (req_end - req_start)
+                max_valid_block = (total_kv_len + sparse_block_size - 1) // sparse_block_size
+
+                bm_base = g * stride_bm_g
+
+                for w in range(BITMAP_WORDS):
+                    tl.store(bitmap_ptr + bm_base + w * stride_bm_w, 0)
+
+                for i in range(TOTAL_IDS):
+                    h_idx = i // max_sparse
+                    k_idx = i % max_sparse
+                    if k_idx < s_count:
+                        bid = tl.load(
+                            indices_flat_ptr
+                            + g * stride_idx_g
+                            + h_idx * stride_idx_h
+                            + k_idx * stride_idx_k,
+                        ).to(tl.int32)
+                        if bid >= 0:
+                            if bid < max_valid_block:
+                                word_idx = bid >> 5
+                                bit_idx = bid & 31
+                                old_word = tl.load(
+                                    bitmap_ptr + bm_base + word_idx * stride_bm_w)
+                                tl.store(
+                                    bitmap_ptr + bm_base + word_idx * stride_bm_w,
+                                    old_word | (1 << bit_idx),
+                                )
+
+                write_pos = 0
+                for w in range(BITMAP_WORDS):
+                    word = tl.load(bitmap_ptr + bm_base + w * stride_bm_w)
+                    base_bid = w * 32
+                    for b in range(32):
+                        if word & (1 << b):
+                            block_id = base_bid + b
+                            if block_id < max_valid_block:
+                                if write_pos < max_union_len:
+                                    tl.store(
+                                        group_union_indices_ptr
+                                        + g * stride_gi_g
+                                        + write_pos * stride_gi_k,
+                                        block_id,
+                                    )
+                                    write_pos += 1
+
+                tl.store(group_union_seq_len_ptr + g, write_pos)
+
+
+def _union_unique_bitmap(
     indices_flat: torch.Tensor,
     seq_len_flat: torch.Tensor,
-    num_kv_heads: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Match xpu_gpt SALS semantics: each Q group shares union(KV-head blocks)."""
+    group_qid: torch.Tensor,
+    cumsum_q_len: torch.Tensor,
+    base_kv_len: torch.Tensor,
+    sparse_block_size: int,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     G = int(indices_flat.shape[0])
-    K = int(indices_flat.shape[2]) if indices_flat.dim() == 3 else 0
-    unions = []
-    max_union = 0
-    for group in range(G):
-        s_count = int(seq_len_flat[group].item()) if seq_len_flat.numel() > group else 0
-        if s_count <= 0 or K <= 0:
-            union = indices_flat.new_empty((0,), dtype=torch.int32)
-        else:
-            blocks = indices_flat[group, :, : min(s_count, K)].reshape(-1)
-            blocks = blocks[blocks >= 0]
-            union = torch.unique(blocks, sorted=True).to(torch.int32) if blocks.numel() > 0 else blocks.to(torch.int32)
-        unions.append(union)
-        max_union = max(max_union, int(union.numel()))
+    device = indices_flat.device
+    if G == 0:
+        return None, None
 
-    out_k = max(max_union, 1)
-    union_indices = torch.full(
-        (G, num_kv_heads, out_k),
-        -1,
-        dtype=torch.int32,
-        device=indices_flat.device,
+    kv_heads_val = indices_flat.shape[1]
+    max_sparse_val = indices_flat.shape[2]
+    total_ids = kv_heads_val * max_sparse_val
+    if total_ids == 0:
+        return None, None
+
+    qids = group_qid.long()
+    base_kv_vals = base_kv_len[qids]
+    q_starts = cumsum_q_len[qids]
+    safe_next = (qids + 1).clamp(max=cumsum_q_len.shape[0] - 1)
+    valid_next = qids + 1 < cumsum_q_len.shape[0]
+    q_ends = torch.where(valid_next, cumsum_q_len[safe_next], q_starts)
+    q_len_vals = q_ends - q_starts
+    total_kv_vals = base_kv_vals + q_len_vals
+    max_total_kv = int(total_kv_vals.max().item())
+    if max_total_kv == 0:
+        return None, None
+
+    max_valid_block_all = (max_total_kv + sparse_block_size - 1) // sparse_block_size
+    BITMAP_WORDS_VAL = (max_valid_block_all + 31) // 32
+    max_union_len = total_ids
+
+    bitmap = torch.zeros(G, BITMAP_WORDS_VAL, dtype=torch.int32, device=device)
+    group_union_indices = torch.zeros(
+        G, max_union_len, dtype=indices_flat.dtype, device=device)
+    group_union_seq_len = torch.zeros(G, dtype=torch.int32, device=device)
+
+    core_num = get_num_cores("vector")
+    prog_num = min(G, core_num)
+    tasks_per_prog = triton.cdiv(G, prog_num)
+
+    s_idx_g, s_idx_h, s_idx_k = (
+        indices_flat.stride(0), indices_flat.stride(1), indices_flat.stride(2))
+    s_gi_g, s_gi_k = group_union_indices.stride(0), group_union_indices.stride(1)
+    s_bm_g, s_bm_w = bitmap.stride(0), bitmap.stride(1)
+
+    _union_unique_bitmap_kernel[(prog_num,)](
+        indices_flat, seq_len_flat,
+        group_qid, cumsum_q_len, base_kv_len,
+        cumsum_q_len.shape[0],
+        group_union_indices, group_union_seq_len,
+        bitmap,
+        s_idx_g, s_idx_h, s_idx_k,
+        s_gi_g, s_gi_k,
+        s_bm_g, s_bm_w,
+        G, tasks_per_prog,
+        kv_heads=kv_heads_val, max_sparse=max_sparse_val,
+        max_union_len=max_union_len,
+        sparse_block_size=sparse_block_size,
+        BITMAP_WORDS=BITMAP_WORDS_VAL,
+        TOTAL_IDS=total_ids,
     )
-    union_seq_len = torch.zeros((G,), dtype=torch.int32, device=seq_len_flat.device)
-    for group, union in enumerate(unions):
-        keep = int(union.numel())
-        union_seq_len[group] = keep
-        if keep > 0:
-            union_indices[group, :, :keep] = union.view(1, keep).expand(num_kv_heads, keep)
-    return union_indices, union_seq_len
+
+    return group_union_indices, group_union_seq_len
 
 
 # ---- Cube helpers (proven patterns from original kernel) ----
@@ -99,7 +220,7 @@ def _gather_kv_to_wksp(
     Wksp_K_ptr, Wksp_V_ptr, Wksp_pos_ptr,
     K_cache_ptr, V_cache_ptr,
     k_scales_ptr, v_scales_ptr,
-    block_tables_ptr, indices_flat_ptr,
+    block_tables_ptr, group_indices_ptr,
     stride_wk_slot, stride_wk_kv, stride_wk_d,
     stride_wv_slot, stride_wv_kv, stride_wv_d,
     stride_wp_slot, stride_wp_kv,
@@ -108,7 +229,7 @@ def _gather_kv_to_wksp(
     stride_ks_h, stride_ks_d,
     stride_vs_h, stride_vs_d,
     stride_bt_req, stride_bt_blk,
-    stride_idx_g, stride_idx_h, stride_idx_k,
+    stride_gi_g, stride_gi_k,
     head_dim: tl.constexpr,
     sparse_block_size: tl.constexpr,
     cache_block_size: tl.constexpr,
@@ -128,8 +249,8 @@ def _gather_kv_to_wksp(
         blk_idx = beg_blk + j
         if j < cur_blk:
             logical_blk = tl.load(
-                indices_flat_ptr + group * stride_idx_g
-                + hkv * stride_idx_h + blk_idx * stride_idx_k,
+                group_indices_ptr + group * stride_gi_g
+                + blk_idx * stride_gi_k,
             ).to(tl.int32)
             if logical_blk >= 0:
                 token_start = logical_blk * sparse_block_size
@@ -187,7 +308,7 @@ def _gather_kv_to_wksp(
 def _sals_sfa_fwd_kernel(
     Q_ptr, K_cache_ptr, V_cache_ptr,
     k_scales_ptr, v_scales_ptr,
-    block_tables_ptr, indices_flat_ptr, seq_len_flat_ptr,
+    block_tables_ptr, group_indices_ptr, seq_len_flat_ptr,
     group_qid_ptr, group_q_start_ptr, group_q_len_ptr,
     cumsum_q_len_ptr, base_kv_len_ptr, group_use_dense_ptr,
     output_ptr,
@@ -197,7 +318,7 @@ def _sals_sfa_fwd_kernel(
     stride_vc_blk, stride_vc_h, stride_vc_s, stride_vc_d,
     stride_ks_h, stride_ks_d, stride_vs_h, stride_vs_d,
     stride_bt_req, stride_bt_blk,
-    stride_idx_g, stride_idx_h, stride_idx_k,
+    stride_gi_g, stride_gi_k,
     stride_o_t, stride_o_h, stride_o_d,
     stride_wk_slot, stride_wk_kv, stride_wk_d,
     stride_wv_slot, stride_wv_kv, stride_wv_d,
@@ -265,7 +386,7 @@ def _sals_sfa_fwd_kernel(
                         K_cache_ptr, V_cache_ptr,
                         k_scales_ptr, v_scales_ptr,
                         block_tables_ptr,
-                        indices_flat_ptr,
+                        group_indices_ptr,
                         stride_wk_slot,
                         stride_wk_kv,
                         stride_wk_d,
@@ -288,9 +409,8 @@ def _sals_sfa_fwd_kernel(
                         stride_vs_d,
                         stride_bt_req,
                         stride_bt_blk,
-                        stride_idx_g,
-                        stride_idx_h,
-                        stride_idx_k,
+                        stride_gi_g,
+                        stride_gi_k,
                         head_dim,
                         sparse_block_size,
                         cache_block_size,
@@ -329,11 +449,11 @@ def _sals_sfa_fwd_kernel(
                             wk_base_v = wksp_id * stride_wv_slot + kv_offset * stride_wv_kv
                             wk_base_p = wksp_id * stride_wp_slot + kv_offset * stride_wp_kv
 
-                            valid_kv = offs_kv[None, :] < cur_kv
                             token_pos = tl.load(
                                 Wksp_pos_ptr + wk_base_p + offs_kv * stride_wp_kv,
                                 mask=offs_kv < cur_kv, other=-1,
                             )
+                            valid_kv = (offs_kv[None, :] < cur_kv) & (token_pos[None, :] >= 0) & (token_pos[None, :] < total_kv_len)
                             scores = cube_qkt_sfa(
                                 Q_ptr, Wksp_K_ptr,
                                 stride_q_t, stride_q_h, stride_q_d,
@@ -400,9 +520,12 @@ def sals_sfa_impl(
     if G == 0:
         return output
 
-    indices_flat, seq_len_flat = _expand_indices_by_group_union(
-        indices_flat, seq_len_flat, num_kv_heads,
+    indices_flat, seq_len_flat = _union_unique_bitmap(
+        indices_flat, seq_len_flat, group_qid, cumsum_q_len, base_kv_len,
+        sparse_block_size,
     )
+    if indices_flat is None:
+        return output
 
     if k_cache.shape[1] == num_kv_heads:
         cache_layout = 0
@@ -460,8 +583,7 @@ def sals_sfa_impl(
     s_vs_h = v_scales.stride(0) if v_scales.numel() > 0 else 0
     s_vs_d = v_scales.stride(1) if v_scales.dim() > 1 and v_scales.numel() > 0 else 0
     s_bt_req, s_bt_blk = block_tables.stride(0), block_tables.stride(1)
-    s_idx_g, s_idx_h, s_idx_k = (
-        indices_flat.stride(0), indices_flat.stride(1), indices_flat.stride(2))
+    s_gi_g, s_gi_k = indices_flat.stride(0), indices_flat.stride(1)
     s_o_t, s_o_h, s_o_d = output.stride(0), output.stride(1), output.stride(2)
     s_wk_slot, s_wk_kv, s_wk_d = (
         workspace_k.stride(0), workspace_k.stride(1), workspace_k.stride(2))
@@ -482,7 +604,7 @@ def sals_sfa_impl(
         s_vc_blk, s_vc_h, s_vc_s, s_vc_d,
         s_ks_h, s_ks_d, s_vs_h, s_vs_d,
         s_bt_req, s_bt_blk,
-        s_idx_g, s_idx_h, s_idx_k,
+        s_gi_g, s_gi_k,
         s_o_t, s_o_h, s_o_d,
         s_wk_slot, s_wk_kv, s_wk_d,
         s_wv_slot, s_wv_kv, s_wv_d,
