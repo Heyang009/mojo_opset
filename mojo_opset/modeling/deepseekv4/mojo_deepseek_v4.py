@@ -1149,7 +1149,6 @@ class DeepseekV4Indexer(nn.Module):
         self.wq_b = MojoQuantGemm(
             in_features=self.q_lora_rank,
             out_features=self.n_heads * self.head_dim,
-            trans_weight=True,
         )
         self.weights_proj = MojoGemm(in_features=self.hidden_size, out_features=self.n_heads, bias=False)
         self.compressor = DeepseekV4Compressor(config, compress_ratio, head_dim=self.head_dim, is_indexer=True)
@@ -1159,6 +1158,10 @@ class DeepseekV4Indexer(nn.Module):
         self.query_dynamic_quant = MojoDynamicQuant()
         self.scatter_nd_update = MojoScatterNdUpdateAsc()
         self.register_buffer("hadamard_matrix", _get_had_pow2(self.head_dim), persistent=False)
+
+    def prepare_quant_proj_weights(self):
+        if self.wq_b.weight_scale.dtype != torch.float32:
+            self.wq_b.weight_scale.data = self.wq_b.weight_scale.data.float()
 
     def forward(self, x, qr, cos, sin, past_key_values=None, layer_idx=0,
                 cu_seqlens_q=None, seq_lens=None, start_pos: Optional[torch.Tensor] = None,
@@ -1294,17 +1297,14 @@ class DeepseekV4Attention(nn.Module):
         self.q_norm = MojoRMSNorm(norm_size=config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_a_quant = MojoDynamicQuant(input_size=config.q_lora_rank)
         nn.init.ones_(self.q_a_quant.inv_smooth_scale)
-        self.wq_b = MojoQuantGemm(in_features=config.q_lora_rank, out_features=self.num_heads * self.head_dim, trans_weight=True)
+        self.wq_b = MojoQuantGemm(in_features=config.q_lora_rank, out_features=self.num_heads * self.head_dim)
         self.q_b_norm = MojoRMSNorm(eps=config.rms_norm_eps, norm_size=self.head_dim)
 
         self.wkv = MojoGemm(in_features=config.hidden_size, out_features=self.head_dim, bias=False, dtype=torch.bfloat16)
         self.kv_norm = MojoRMSNorm(eps=config.rms_norm_eps, norm_size=self.head_dim)
 
         self.wo_a = MojoGemm(in_features=self.num_heads * self.head_dim // self.o_groups, out_features=self.o_groups * self.o_lora_rank, bias=False)
-        self.wo_b = MojoQuantGemm(in_features=self.o_groups * self.o_lora_rank, out_features=config.hidden_size, trans_weight=True)
-        self.register_buffer("_wq_b_weight_tn", None, persistent=False)
-        self.register_buffer("_wo_b_weight_tn", None, persistent=False)
-        self.register_buffer("_wo_a_weight_tbmm", None, persistent=False)
+        self.wo_b = MojoQuantGemm(in_features=self.o_groups * self.o_lora_rank, out_features=config.hidden_size)
 
         self.attn_sink = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
 
@@ -1342,12 +1342,14 @@ class DeepseekV4Attention(nn.Module):
 
     def prepare_wo_a_weight(self) -> torch.Tensor:
         weight = self.wo_a.weight
-        self._wo_a_weight_tbmm = (
-            weight.view(self.o_groups, self.o_lora_rank, -1)
-            .transpose(1, 2)
-            .contiguous()
-        )
-        return self._wo_a_weight_tbmm
+        if weight.dim() == 2:
+            weight = (
+                weight.view(self.o_groups, self.o_lora_rank, -1)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            self.wo_a.weight = nn.Parameter(weight, requires_grad=False)
+        return self.wo_a.weight
 
     @staticmethod
     def _maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
@@ -1362,30 +1364,26 @@ class DeepseekV4Attention(nn.Module):
             weight = DeepseekV4Attention._maybe_cast_weight_to_nz(weight)
         return weight
 
+    @staticmethod
+    def _process_quant_weight_inplace(module: MojoQuantGemm, use_nz: bool = True) -> torch.Tensor:
+        weight = DeepseekV4Attention._prepare_quant_weight_tn(module, use_nz=use_nz)
+        module.weight = weight
+        module.trans_weight = False
+        module.weight_shape = tuple(weight.shape)
+        return module.weight
+
     def prepare_quant_proj_weights(self):
         # Golden casts wq_b scales to fp32 after loading to hit the intended
         # W8A8 path on A3. Keep wo_b scale dtype unchanged for now.
         if self.wq_b.weight_scale.dtype != torch.float32:
             self.wq_b.weight_scale.data = self.wq_b.weight_scale.data.float()
 
-        self._wq_b_weight_tn = self._prepare_quant_weight_tn(self.wq_b, use_nz=True)
-        self._wo_b_weight_tn = self._prepare_quant_weight_tn(self.wo_b, use_nz=True)
-
-    def _get_quant_proj_weight_tn(self, cache_name: str, module: MojoQuantGemm) -> torch.Tensor:
-        cached_weight = getattr(self, cache_name)
-        if (
-            cached_weight is None
-            or cached_weight.device != module.weight.device
-            or cached_weight.dtype != module.weight.dtype
-        ):
-            cached_weight = self._prepare_quant_weight_tn(module)
-            setattr(self, cache_name, cached_weight)
-        return cached_weight
+        self._process_quant_weight_inplace(self.wq_b, use_nz=True)
+        self._process_quant_weight_inplace(self.wo_b, use_nz=True)
 
     @staticmethod
-    def _run_cached_quant_gemm(
+    def _run_quant_gemm(
         module: MojoQuantGemm,
-        cached_weight_tn: torch.Tensor,
         input: torch.Tensor,
         input_scale: torch.Tensor,
     ) -> torch.Tensor:
@@ -1399,7 +1397,7 @@ class DeepseekV4Attention(nn.Module):
 
         out = torch_npu.npu_quant_matmul(
             input,
-            cached_weight_tn,
+            module.weight,
             module.weight_scale.flatten(),
             pertoken_scale=pertoken_scale,
             output_dtype=kernel_output_dtype,
@@ -1409,14 +1407,9 @@ class DeepseekV4Attention(nn.Module):
         return out
 
     def _get_wo_a_weight_for_tbmm(self) -> torch.Tensor:
-        cached_weight = self._wo_a_weight_tbmm
-        if (
-            cached_weight is None
-            or cached_weight.device != self.wo_a.weight.device
-            or cached_weight.dtype != self.wo_a.weight.dtype
-        ):
-            cached_weight = self.prepare_wo_a_weight()
-        return cached_weight
+        if self.wo_a.weight.dim() != 3:
+            return self.prepare_wo_a_weight()
+        return self.wo_a.weight
 
     def _use_mla_multi_stream(self, is_prefill: bool) -> bool:
         return self.enable_attn_mla_multi_stream and not is_prefill
@@ -1850,9 +1843,8 @@ class DeepseekV4Attention(nn.Module):
             qa_flat = qa.reshape(-1, qa.shape[-1]).to(torch.bfloat16)
             qa_quant, qa_scale = self.q_a_quant(qa_flat)
             self._wait_mla_event(wkv_done_event)
-            q = self._run_cached_quant_gemm(
+            q = self._run_quant_gemm(
                 self.wq_b,
-                self._get_quant_proj_weight_tn("_wq_b_weight_tn", self.wq_b),
                 qa_quant,
                 qa_scale,
             )
@@ -2112,9 +2104,8 @@ class DeepseekV4Attention(nn.Module):
         )
         wo_a_out = wo_a_out.reshape(batch_size * seq_length, -1).to(torch.bfloat16)
         wo_a_quant, wo_a_scale = _dynamic_quant_per_token(wo_a_out)
-        wo_b_out = self._run_cached_quant_gemm(
+        wo_b_out = self._run_quant_gemm(
             self.wo_b,
-            self._get_quant_proj_weight_tn("_wo_b_weight_tn", self.wo_b),
             wo_a_quant,
             wo_a_scale,
         )
@@ -2130,9 +2121,9 @@ class DeepseekV4SharedExpert(nn.Module):
         self.intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.swiglu_limit = config.swiglu_limit
 
-        self.gate_proj = MojoQuantGemm(in_features=self.hidden_size, out_features=self.intermediate_size, trans_weight=True)
-        self.up_proj = MojoQuantGemm(in_features=self.hidden_size, out_features=self.intermediate_size, trans_weight=True)
-        self.down_proj = MojoQuantGemm(in_features=self.intermediate_size, out_features=self.hidden_size, trans_weight=True)
+        self.gate_proj = MojoQuantGemm(in_features=self.hidden_size, out_features=self.intermediate_size)
+        self.up_proj = MojoQuantGemm(in_features=self.hidden_size, out_features=self.intermediate_size)
+        self.down_proj = MojoQuantGemm(in_features=self.intermediate_size, out_features=self.hidden_size)
         self.gate_quant = MojoDynamicQuant(input_size=self.hidden_size)
         self.up_quant = MojoDynamicQuant(input_size=self.hidden_size)
         self.intermediate_quant = MojoDynamicQuant(input_size=self.intermediate_size)
@@ -2143,19 +2134,17 @@ class DeepseekV4SharedExpert(nn.Module):
         nn.init.ones_(self.intermediate_quant.inv_smooth_scale)
         self.register_buffer("_gate_up_weight_cache", None, persistent=False)
         self.register_buffer("_gate_up_weight_scale_cache", None, persistent=False)
-        self.register_buffer("_down_proj_weight_tn", None, persistent=False)
 
     def prepare_quant_proj_weights(self):
-        self._gate_up_weight_cache = DeepseekV4Attention._maybe_cast_weight_to_nz(torch.cat(
-            (self.gate_proj.weight, self.up_proj.weight), dim=0
-        ).transpose(0, 1).contiguous()
+        DeepseekV4Attention._process_quant_weight_inplace(self.gate_proj, use_nz=False)
+        DeepseekV4Attention._process_quant_weight_inplace(self.up_proj, use_nz=False)
+        DeepseekV4Attention._process_quant_weight_inplace(self.down_proj, use_nz=True)
+        self._gate_up_weight_cache = DeepseekV4Attention._maybe_cast_weight_to_nz(
+            torch.cat((self.gate_proj.weight, self.up_proj.weight), dim=1).contiguous()
         )
         self._gate_up_weight_scale_cache = torch.cat(
             (self.gate_proj.weight_scale, self.up_proj.weight_scale), dim=0
         ).contiguous().view(-1).float()
-        self._down_proj_weight_tn = DeepseekV4Attention._prepare_quant_weight_tn(
-            self.down_proj, use_nz=True
-        )
 
     def _get_gate_up_weight(self):
         if (
@@ -2165,17 +2154,6 @@ class DeepseekV4SharedExpert(nn.Module):
         ):
             self.prepare_quant_proj_weights()
         return self._gate_up_weight_cache, self._gate_up_weight_scale_cache
-
-    def _get_down_proj_weight_tn(self):
-        cached_weight = self._down_proj_weight_tn
-        if (
-            cached_weight is None
-            or cached_weight.device != self.down_proj.weight.device
-            or cached_weight.dtype != self.down_proj.weight.dtype
-        ):
-            self.prepare_quant_proj_weights()
-            cached_weight = self._down_proj_weight_tn
-        return cached_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -2214,9 +2192,8 @@ class DeepseekV4SharedExpert(nn.Module):
             )
             intermediate_scale = intermediate_scale.unsqueeze(-1)
         with _profile_timer(self.layer_idx, "shared_expert_down") if hasattr(self, "layer_idx") else nullcontext():
-            return DeepseekV4Attention._run_cached_quant_gemm(
+            return DeepseekV4Attention._run_quant_gemm(
                 self.down_proj,
-                self._get_down_proj_weight_tn(),
                 intermediate_quant,
                 intermediate_scale,
             ).view(*orig_shape)
@@ -2943,6 +2920,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         return weight
 
     @staticmethod
+    def _align_quant_gemm_weight(weight, target, module):
+        if isinstance(module, MojoQuantGemm) and weight.dim() == 2 and target.dim() == 2:
+            if weight.shape != target.shape and weight.t().shape == target.shape:
+                weight = weight.t().contiguous()
+        return DeepseekV4ForCausalLM._align_weight(weight, target)
+
+    @staticmethod
     def _init_default_weights(model):
         for module_name, module in model.named_modules():
             cls_name = type(module).__name__
@@ -2989,6 +2973,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         params_dict = dict(model.named_parameters())
         buffers_dict = dict(model.named_buffers())
+        modules_dict = dict(model.named_modules())
 
         expert_weights = {}
         for sf_file in sorted(file_to_keys.keys()):
@@ -3011,7 +2996,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                         param.data.copy_(weight)
                 elif model_name in buffers_dict:
                     buf = buffers_dict[model_name]
-                    weight = DeepseekV4ForCausalLM._align_weight(weight, buf)
+                    module_name = model_name.rsplit(".", 1)[0]
+                    module = modules_dict.get(module_name)
+                    weight = DeepseekV4ForCausalLM._align_quant_gemm_weight(weight, buf, module)
                     if buf.shape == weight.shape:
                         buf.data.copy_(weight)
             del data
@@ -3027,6 +3014,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             self_attn = model.model.layers[layer_idx].self_attn
             self_attn.prepare_wo_a_weight()
             self_attn.prepare_quant_proj_weights()
+            if self_attn.indexer is not None:
+                self_attn.indexer.prepare_quant_proj_weights()
             model.model.layers[layer_idx].mlp.shared_experts.prepare_quant_proj_weights()
 
         if model.ep_size > 1 and dist.is_initialized():
