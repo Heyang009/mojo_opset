@@ -453,7 +453,7 @@ def _sals_sfa_fwd_kernel(
                                 Wksp_pos_ptr + wk_base_p + offs_kv * stride_wp_kv,
                                 mask=offs_kv < cur_kv, other=-1,
                             )
-                            valid_kv = (offs_kv[None, :] < cur_kv) & (token_pos[None, :] >= 0) & (token_pos[None, :] < total_kv_len)
+                            valid_kv = (offs_kv < cur_kv) & (token_pos >= 0) & (token_pos < total_kv_len)
                             scores = cube_qkt_sfa(
                                 Q_ptr, Wksp_K_ptr,
                                 stride_q_t, stride_q_h, stride_q_d,
@@ -462,15 +462,13 @@ def _sals_sfa_fwd_kernel(
                                 q_offs, offs_kv, q_base, wk_base_k, cur_kv,
                             )
                             scores = scores * softmax_scale
-                            causal_mask = token_pos[None, :] > causal_thresh[:, None]
-                            scores = tl.where(valid_kv, scores, float('-inf'))
-                            scores = tl.where(mask_q[:, None], scores, float('-inf'))
-                            scores = tl.where(causal_mask, float('-inf'), scores)
+                            attn_mask = valid_kv[None, :] & mask_q[:, None] & (token_pos[None, :] <= causal_thresh[:, None])
+                            scores = tl.where(attn_mask, scores, float('-inf'))
                             row_max_j = tl.max(scores, axis=1)
                             m_new = tl.maximum(m_i, row_max_j)
                             alpha = tl.where(m_i > float('-inf'), tl.exp(m_i - m_new), 0.0)
                             p = tl.exp(scores - m_new[:, None])
-                            p = tl.where(scores > float('-inf'), p, 0.0)
+                            p = tl.where(attn_mask, p, 0.0)
                             l_i = alpha * l_i + tl.sum(p, axis=1)
                             pv = cube_pv_sfa(
                                 p, Wksp_V_ptr,
