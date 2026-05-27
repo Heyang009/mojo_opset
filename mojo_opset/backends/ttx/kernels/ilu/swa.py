@@ -1118,6 +1118,7 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
     cu_seqlens_q_ptr,
     seqlens_kv_ptr,
     block_tables_ptr,
+    bsz,
     stride_qt, stride_qh, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -1161,7 +1162,7 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
     cu_q_chunks = 0
     q_offsets = tl.arange(0, BLOCK_M)
 
-    for b_id in range(seqlens_kv_ptr.shape[0]):
+    for b_id in range(bsz):
         q_start = tl.load(cu_seqlens_q_ptr + b_id).to(tl.int32)
         q_end = tl.load(cu_seqlens_q_ptr + b_id + 1).to(tl.int32)
         kv_seq_len = tl.load(seqlens_kv_ptr + b_id).to(tl.int32)
@@ -1233,7 +1234,8 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
             acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
             if IS_CAUSAL:
-                kv_loop_end = tl.minimum(kv_seq_len, q_abs[-1] + 1)
+                q_abs_end = q_block_start + q_block_len - 1 + kv_computed_len
+                kv_loop_end = tl.minimum(kv_seq_len, q_abs_end + 1)
             else:
                 kv_loop_end = kv_seq_len
 
@@ -1505,6 +1507,7 @@ def swa_paged_prefill_with_kv_dequant_impl(
         cu_seqlens_q,
         seqlens_kv,
         block_tables_i32,
+        batch_size,
         q.stride(0), q.stride(1), q.stride(2),
         key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3),
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
@@ -1518,7 +1521,6 @@ def swa_paged_prefill_with_kv_dequant_impl(
         GQA_INTERLEAVE=gqa_interleave,
         HEAD_DIM=head_dim,
         BLOCK_D=BLOCK_D,
-        BLOCK_M=64,
         BLOCK_N=BLOCK_N,
         PAGE_SIZE=page_size,
         IS_CAUSAL=is_causal,
