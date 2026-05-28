@@ -1631,7 +1631,7 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(head_dim)
 
-        outputs = torch.zeros(total_q_tokens, num_q_heads, head_dim, dtype=torch.bfloat16, device=query.device) #ixformer kernel 默认输出bf16
+        outputs = torch.zeros(total_q_tokens, num_q_heads, head_dim, dtype=torch.bfloat16, device=query.device)  # ixformer kernel outputs bf16 by default
 
         q_lens = _seq_lens_from_cu(cu_q_lens)
         total_seq_lens = q_lens if cu_total_seq_lens is None else _seq_lens_from_cu(cu_total_seq_lens)
@@ -1714,9 +1714,10 @@ class MojoPagedPrefillSageGQA(MojoOperator):
 
             attn_scores_max = torch.max(attn_scores, dim=-1, keepdim=True).values
             attn_scores_stable_exp = torch.exp(attn_scores - attn_scores_max)
-            attn_scores_sum = torch.sum(attn_scores_stable_exp, dim=-1, keepdim=True)
             # quant for unnormalized attention scores
             attn_score_safe_exp_quant, attn_score_safe_exp_scale = torch.round(attn_scores_stable_exp * self.qmax), 1. / self.qmax
+            # sum quantized values for denominator to match numerator
+            attn_scores_sum = torch.sum(attn_score_safe_exp_quant, dim=-1, keepdim=True) * attn_score_safe_exp_scale
             v_expanded_float = v_expanded.float()
             # v_expanded_float: [kv_seq_len, Hq, D], v_scale_expanded: [1, Hq, D], attn_probs_scale: const = 1./self.qmax
             outputs[start_loc:end_loc] = (

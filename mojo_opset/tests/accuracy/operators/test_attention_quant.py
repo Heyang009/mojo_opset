@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import pytest
 import torch
@@ -263,7 +263,7 @@ def per_channel_int8(
     xm: Optional[torch.Tensor] = None,
     scale: Optional[torch.Tensor] = None,
     *,
-    seq_dim: int = 0,
+    seq_dim: Union[int, Sequence[int]] = 0,
     q_max: int = 127,
     q_min: int = -128,
 ):
