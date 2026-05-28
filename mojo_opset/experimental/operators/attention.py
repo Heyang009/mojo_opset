@@ -1532,9 +1532,9 @@ class MojoPagedPrefillSageGQA(MojoOperator):
         self,
         is_causal: bool = True,
         gqa_layout: str = "AABB",
-        query_dtype: torch.dtype = torch.bfloat16,
+        query_dtype: torch.dtype = torch.int8,
         context_dtype: torch.dtype = torch.int8,
-        compute_dtype: torch.dtype = torch.bfloat16,
+        compute_dtype: torch.dtype = torch.int8,
     ):
         """
         Initialize the Paged Prefill GQA attention operator with common parameters.
