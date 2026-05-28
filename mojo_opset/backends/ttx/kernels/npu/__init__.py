@@ -49,6 +49,18 @@ from .swa import swa_paged_decode_impl
 from .swa import swa_paged_prefill_impl
 from .swiglu import swiglu_bwd_impl
 from .swiglu import swiglu_fwd_impl
+try:
+    from .allgather_gemm import allgather_gemm_impl
+except ImportError:
+    pass
+try:
+    from .gemm_allreduce import gemm_allreduce_impl
+except ImportError:
+    pass
+try:
+    from .gemm_reduce_scatter import gemm_reduce_scatter_impl
+except ImportError:
+    pass
 
 # Over-Encoding (OE)
 from .over_encoding.embedding import embedding_nf4_dequant_impl
@@ -112,4 +124,7 @@ __all__ = [
     "n_gram_decode_impl",
     "n_gram_prefill_impl",
     "over_encoding_decode_impl",
+    "allgather_gemm_impl",
+    "gemm_allreduce_impl",
+    "gemm_reduce_scatter_impl",
 ]
