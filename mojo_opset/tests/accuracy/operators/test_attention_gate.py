@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn as nn
 
 from mojo_opset.experimental import MojoFusedAttnOutputGate
 from mojo_opset.tests.utils import auto_switch_platform, bypass_not_implemented
@@ -56,7 +57,10 @@ def test_fused_attn_output_gate(seq_len, hidden_size, num_heads_full, num_heads_
         bias=bias,
         dtype=dtype,
     )
-    op_ref.load_state_dict(op.state_dict())
+    for p in op_ref.parameters():
+        nn.init.normal_(p, std=0.02)
+    
+    op.load_state_dict(op_ref.state_dict())
 
     hidden_states = torch.randn(seq_len, hidden_size, dtype=dtype)
     full_attn_output = torch.randn(seq_len, num_heads_full, head_dim, dtype=dtype)

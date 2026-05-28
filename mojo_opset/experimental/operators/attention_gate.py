@@ -61,12 +61,6 @@ class MojoFusedAttnOutputGate(MojoOperator):
         self._cached_weight: torch.Tensor | None = None
         self._cached_bias: torch.Tensor | None = None
 
-        self._register_load_state_dict_pre_hook(self._invalidate_cache_hook)
-
-    def _invalidate_cache_hook(self, state_dict, prefix, *args, **kwargs):
-        self._cached_weight = None
-        self._cached_bias = None
-
     def _get_fused_weight(self) -> torch.Tensor:
         if self._cached_weight is None:
             self._cached_weight = torch.cat(
