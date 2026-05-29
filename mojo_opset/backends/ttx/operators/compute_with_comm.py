@@ -37,7 +37,7 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
         self._rank = None
         self._world_size = None
 
-    def _ensure_shmem(self, K: int) -> None:
+    def _ensure_shmem(self, K: int, dtype: torch.dtype = torch.float16) -> None:
         if self._peer_mem is not None:
             return
 
@@ -57,7 +57,7 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
         buffer_num = 2
         flat_size = BLOCK_SIZE_M * pvalue * world_size * buffer_num * max(K, BLOCK_SIZE_K)
         self._peer_mem = ash.aclshmem_create_tensor(
-            [flat_size], dtype=torch.float16, device_id=rank
+            [flat_size], dtype=dtype, device_id=rank
         )
         self._rank = rank
         self._world_size = world_size
@@ -73,7 +73,7 @@ class TTXAllGatherGemm(MojoAllGatherGemm):
         K = input.shape[-1]
         input_2d = input.reshape(-1, K).contiguous()
 
-        self._ensure_shmem(K)
+        self._ensure_shmem(K, input.dtype)
 
         if self.trans_weight:
             weight = self.weight
@@ -134,7 +134,7 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
         self._rank = None
         self._world_size = None
 
-    def _ensure_shmem(self) -> None:
+    def _ensure_shmem(self, dtype: torch.dtype = torch.float16) -> None:
         if self._peer_mem is not None:
             return
 
@@ -155,7 +155,7 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
         buffer_num = 2
         flat_size = BLOCK_SIZE_M * pvalue * ncore * buffer_num * BLOCK_SIZE_N
         self._peer_mem = ash.aclshmem_create_tensor(
-            [flat_size], dtype=torch.float16, device_id=rank
+            [flat_size], dtype=dtype, device_id=rank
         )
         self._rank = rank
         self._world_size = world_size
@@ -168,7 +168,7 @@ class TTXGemmAllReduce(MojoGemmAllReduce):
         K = input.shape[-1]
         input_2d = input.reshape(-1, K).contiguous()
 
-        self._ensure_shmem()
+        self._ensure_shmem(input.dtype)
 
         if self.trans_weight:
             weight = self.weight
@@ -212,7 +212,7 @@ class TTXGemmReduceScatter(MojoGemmReduceScatter):
         self._rank = None
         self._world_size = None
 
-    def _ensure_shmem(self) -> None:
+    def _ensure_shmem(self, dtype: torch.dtype = torch.float16) -> None:
         if self._peer_mem is not None:
             return
 
@@ -233,7 +233,7 @@ class TTXGemmReduceScatter(MojoGemmReduceScatter):
         buffer_num = 2
         flat_size = BLOCK_SIZE_M * pvalue * ncore * buffer_num * BLOCK_SIZE_N
         self._peer_mem = ash.aclshmem_create_tensor(
-            [flat_size], dtype=torch.float16, device_id=rank
+            [flat_size], dtype=dtype, device_id=rank
         )
         self._rank = rank
         self._world_size = world_size

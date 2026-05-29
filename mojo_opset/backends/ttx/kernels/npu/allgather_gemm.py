@@ -73,9 +73,9 @@ def kernel_allgather_gemm(
     BLOCK_SIZE_K: tl.constexpr,
     COMM_BLOCK_SIZE_M: tl.constexpr,
     COMM_BLOCK_SIZE_K: tl.constexpr,
-    is_fp8: tl.constexpr,
+    IS_BF16: tl.constexpr,
 ):
-    dtype = tl.float16 if not is_fp8 else tl.float8e4nv
+    dtype = tl.bfloat16 if IS_BF16 else tl.float16
     subblock_idx = sub_vec_id()
     ncore = tl.num_programs(axis=0)
     pid = tl.program_id(axis=0)
@@ -234,6 +234,6 @@ def allgather_gemm_impl(
         BLOCK_SIZE_K,
         COMM_BLOCK_SIZE_M,
         COMM_BLOCK_SIZE_K,
-        False,
+        input.dtype == torch.bfloat16,
     )
     return output

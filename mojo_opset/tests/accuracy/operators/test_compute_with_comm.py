@@ -184,6 +184,7 @@ def _dist_all_gather_gemm():
         (4096, 4096, 4096, torch.float16),
         (2048, 4096, 8192, torch.float16),
         (8192, 2048, 4096, torch.float16),
+        (4096, 4096, 4096, torch.bfloat16),
     ]
 
     for M, K, N, dtype in test_cases:
@@ -228,6 +229,7 @@ def _dist_gemm_all_reduce():
         (4096, 4096, 4096, torch.float16),
         (2048, 8192, 4096, torch.float16),
         (8192, 4096, 2048, torch.float16),
+        (4096, 4096, 4096, torch.bfloat16),
     ]
 
     for M, K, N, dtype in test_cases:
@@ -268,6 +270,7 @@ def _dist_gemm_reduce_scatter():
         (4096, 4096, 4096, torch.float16),
         (2048, 8192, 4096, torch.float16),
         (8192, 4096, 2048, torch.float16),
+        (4096, 4096, 4096, torch.bfloat16),
     ]
 
     for M, K, N, dtype in test_cases:

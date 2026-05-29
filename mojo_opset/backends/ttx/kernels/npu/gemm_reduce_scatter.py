@@ -36,9 +36,9 @@ def kernel_gemm_reduce_scatter(
     BLOCK_SIZE_K: tl.constexpr,
     COMM_BLOCK_SIZE_M: tl.constexpr,
     COMM_BLOCK_SIZE_N: tl.constexpr,
-    is_fp8: tl.constexpr,
+    IS_BF16: tl.constexpr,
 ):
-    dtype = tl.float16 if not is_fp8 else tl.float8e4nv
+    dtype = tl.bfloat16 if IS_BF16 else tl.float16
     subblock_idx = sub_vec_id()
     ncore = tl.num_programs(axis=0)
     pid = tl.program_id(axis=0)
@@ -185,5 +185,5 @@ def gemm_reduce_scatter_impl(
         weight.stride(0), weight.stride(1),
         output.stride(0), output.stride(1),
         pvalue, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-        COMM_BLOCK_SIZE_M, COMM_BLOCK_SIZE_N, False,
+        COMM_BLOCK_SIZE_M, COMM_BLOCK_SIZE_N, input.dtype == torch.bfloat16,
     )
