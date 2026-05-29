@@ -202,27 +202,48 @@ def get_attn_dp_shard_range(total_batch, *, global_rank, world_size, attn_tp_siz
     if cp_size <= 0:
         raise ValueError(f"cp_size must be > 0, got {cp_size}")
 
-    # CP ranks must keep the same batch shard; otherwise CP gather mixes different samples.
-    attn_group_size = attn_tp_size * cp_size
-    if world_size % attn_group_size != 0:
+    # Golden-style split: decode/batch ownership is controlled by attention DP
+    # only. CP prefill uses a separate prefill_dp_size and, when cp_size > 1,
+    # requires cp_size == world_size so all ranks form one CP group.
+    if cp_size > 1 and world_size != cp_size:
         raise ValueError(
-            f"world_size={world_size} is not divisible by attn_tp_size * cp_size="
-            f"{attn_tp_size} * {cp_size} = {attn_group_size}"
+            f"Golden-style CP requires cp_size == world_size when CP is enabled, "
+            f"got cp_size={cp_size}, world_size={world_size}."
+        )
+    if world_size % attn_tp_size != 0:
+        raise ValueError(
+            f"world_size={world_size} is not divisible by attn_tp_size={attn_tp_size}"
         )
 
-    dp_group_count = world_size // attn_group_size
+    dp_group_count = world_size // attn_tp_size
     if total_batch % dp_group_count != 0:
         raise ValueError(
             f"DeepseekV4 DP requires batch_size={total_batch} to be divisible by "
-            f"attn_dp_size={dp_group_count} (world_size={world_size}, attn_tp_size={attn_tp_size}, "
-            f"cp_size={cp_size})."
+            f"attn_dp_size={dp_group_count} (world_size={world_size}, attn_tp_size={attn_tp_size})."
         )
 
-    dp_rank = global_rank // attn_group_size
+    dp_rank = global_rank // attn_tp_size
     shard_size = total_batch // dp_group_count
     start = dp_rank * shard_size
     end = start + shard_size
     return start, end, dp_group_count, dp_rank
+
+
+def gather_decode_shard_tensor(tensor, total_batch, shard_start, attn_dp_size):
+    del shard_start
+    if not dist.is_initialized() or attn_dp_size <= 1:
+        return tensor
+    if tensor.shape[0] == total_batch:
+        return tensor
+    local_batch = tensor.shape[0]
+    if total_batch != local_batch * attn_dp_size:
+        raise ValueError(
+            "Cannot gather decode shards with uneven local batch: "
+            f"total_batch={total_batch}, local_batch={local_batch}, attn_dp_size={attn_dp_size}"
+        )
+    gathered = tensor.new_empty((attn_dp_size, *tensor.shape))
+    dist.all_gather_into_tensor(gathered, tensor.contiguous())
+    return gathered.reshape(total_batch, *tensor.shape[1:])
 
 
 def shard_batch_for_attn_dp(
@@ -460,6 +481,187 @@ def _copy_paged_dummy_cache_batch(dst_cache, src_cache, dst_batch_idx: int) -> N
             )
 
 
+def build_mtp_prefill_inputs(input_ids, attention_mask, next_token_id, pad_token_id):
+    batch_size, seq_len = input_ids.shape
+    mtp_input_ids = torch.full_like(input_ids, pad_token_id)
+    mtp_attention_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+    valid_lens = attention_mask.to(dtype=torch.int32).sum(dim=-1).to(dtype=torch.long)
+
+    max_history_len = int((valid_lens.max() + 1).item()) if valid_lens.numel() > 0 else 0
+    confirmed_generate_ids = torch.full(
+        (batch_size, max_history_len),
+        pad_token_id,
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    for row in range(batch_size):
+        valid_len = int(valid_lens[row].item())
+        if valid_len <= 0:
+            raise ValueError("MTP prefill expects every request to have at least one valid input token.")
+        shifted = torch.cat([input_ids[row, 1:valid_len], next_token_id[row]], dim=0)
+        mtp_input_ids[row, : shifted.numel()] = shifted
+        mtp_attention_mask[row, : shifted.numel()] = True
+
+        history = torch.cat([input_ids[row, :valid_len], next_token_id[row]], dim=0)
+        confirmed_generate_ids[row, max_history_len - history.numel():] = history
+
+    return mtp_input_ids, mtp_attention_mask, confirmed_generate_ids
+
+
+def forward_mtp_prefill_mojo(
+    mtp_model,
+    hidden_states,
+    input_ids,
+    attention_mask,
+    runtime_state,
+    *,
+    max_seq_len,
+    next_n,
+    use_attn_metadata=True,
+):
+    cp_size = int(getattr(mtp_model, "cp_size", 1))
+    if cp_size <= 1:
+        mtp_prefill_meta = runtime_state.prepare_prefill_inputs(
+            input_ids,
+            attention_mask=attention_mask,
+            q_lens=None,
+        )
+        mtp_out = mtp_model(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=mtp_prefill_meta["position_ids"],
+            past_key_values=runtime_state.paged_cache,
+            use_cache=True,
+            is_prefill=True,
+            attn_inputs=mtp_prefill_meta["attn_inputs"],
+            attn_metadata=mtp_prefill_meta.get("attn_metadata") if use_attn_metadata else None,
+            context_lens=mtp_prefill_meta["context_lens"],
+            q_lens=mtp_prefill_meta["q_lens"],
+            input_ids=input_ids,
+            return_hidden=True,
+        )
+        return mtp_out
+
+    local_batch = input_ids.shape[0]
+    runtime_batch = int(runtime_state.paged_cache.batch_size)
+    if runtime_batch != local_batch:
+        raise ValueError(
+            "MTP CP prefill runtime batch size mismatch: "
+            f"runtime_batch={runtime_batch}, local_batch={local_batch}"
+        )
+
+    logits_chunks = []
+    hidden_chunks = []
+    past_key_values = runtime_state.paged_cache
+    for local_slot in range(local_batch):
+        minibatch_runtime = DeepseekMTPRuntimeState.from_model(
+            mtp_model,
+            batch_size=1,
+            device=input_ids.device,
+            max_seq_len=max_seq_len,
+            next_n=next_n,
+        )
+        mtp_prefill_meta = minibatch_runtime.prepare_prefill_inputs(
+            input_ids[local_slot: local_slot + 1],
+            attention_mask=attention_mask[local_slot: local_slot + 1],
+            q_lens=None,
+        )
+        mtp_logits, past_key_values, mtp_hidden = mtp_model(
+            hidden_states=hidden_states[local_slot: local_slot + 1],
+            attention_mask=attention_mask[local_slot: local_slot + 1],
+            position_ids=mtp_prefill_meta["position_ids"],
+            past_key_values=minibatch_runtime.paged_cache,
+            use_cache=True,
+            is_prefill=True,
+            attn_inputs=mtp_prefill_meta["attn_inputs"],
+            attn_metadata=mtp_prefill_meta.get("attn_metadata") if use_attn_metadata else None,
+            context_lens=mtp_prefill_meta["context_lens"],
+            q_lens=mtp_prefill_meta["q_lens"],
+            input_ids=input_ids[local_slot: local_slot + 1],
+            return_hidden=True,
+        )
+        _copy_paged_dummy_cache_batch(runtime_state.paged_cache, minibatch_runtime.paged_cache, local_slot)
+        logits_chunks.append(mtp_logits)
+        hidden_chunks.append(mtp_hidden)
+        del minibatch_runtime
+
+    return torch.cat(logits_chunks, dim=0), past_key_values, torch.cat(hidden_chunks, dim=0)
+
+
+def forward_mtp_cp_prefill_minibatch_mojo(
+    mtp_model,
+    hidden_states,
+    input_ids,
+    attention_mask,
+    runtime_state,
+    *,
+    local_shard_start,
+    local_shard_end,
+    max_seq_len,
+    next_n,
+    use_attn_metadata=True,
+):
+    total_batch = input_ids.shape[0]
+    local_batch = local_shard_end - local_shard_start
+    runtime_batch = int(runtime_state.paged_cache.batch_size)
+    if runtime_batch != local_batch:
+        raise ValueError(
+            "MTP Golden CP prefill runtime batch size mismatch: "
+            f"runtime_batch={runtime_batch}, local_batch={local_batch}, "
+            f"owner_range=[{local_shard_start}, {local_shard_end})"
+        )
+    if hidden_states is None or hidden_states.shape[0] != total_batch:
+        raise ValueError(
+            "MTP Golden CP prefill needs CP-local main hidden states for every global sample: "
+            f"hidden_batch={None if hidden_states is None else hidden_states.shape[0]}, total_batch={total_batch}"
+        )
+
+    logits_chunks = []
+    hidden_chunks = []
+    past_key_values = runtime_state.paged_cache
+    for global_batch_idx in range(total_batch):
+        owns_sample = local_shard_start <= global_batch_idx < local_shard_end
+        minibatch_runtime = DeepseekMTPRuntimeState.from_model(
+            mtp_model,
+            batch_size=1,
+            device=input_ids.device,
+            max_seq_len=max_seq_len,
+            next_n=next_n,
+        )
+        mtp_prefill_meta = minibatch_runtime.prepare_prefill_inputs(
+            input_ids[global_batch_idx: global_batch_idx + 1],
+            attention_mask=attention_mask[global_batch_idx: global_batch_idx + 1],
+            q_lens=None,
+        )
+        mtp_logits, past_key_values, mtp_hidden = mtp_model(
+            hidden_states=hidden_states[global_batch_idx: global_batch_idx + 1],
+            attention_mask=attention_mask[global_batch_idx: global_batch_idx + 1],
+            position_ids=mtp_prefill_meta["position_ids"],
+            past_key_values=minibatch_runtime.paged_cache,
+            use_cache=True,
+            is_prefill=True,
+            attn_inputs=mtp_prefill_meta["attn_inputs"],
+            attn_metadata=mtp_prefill_meta.get("attn_metadata") if use_attn_metadata else None,
+            context_lens=mtp_prefill_meta["context_lens"],
+            q_lens=mtp_prefill_meta["q_lens"],
+            input_ids=input_ids[global_batch_idx: global_batch_idx + 1],
+            return_hidden=True,
+        )
+        if owns_sample:
+            local_slot = global_batch_idx - local_shard_start
+            _copy_paged_dummy_cache_batch(runtime_state.paged_cache, minibatch_runtime.paged_cache, local_slot)
+            logits_chunks.append(mtp_logits)
+            hidden_chunks.append(mtp_hidden)
+        del minibatch_runtime
+
+    if not logits_chunks:
+        raise RuntimeError(
+            "MTP Golden CP prefill did not collect owner logits. "
+            f"owner_range=[{local_shard_start}, {local_shard_end}), total_batch={total_batch}"
+        )
+    return torch.cat(logits_chunks, dim=0), past_key_values, torch.cat(hidden_chunks, dim=0)
+
+
 def forward_cp_prefill_minibatch_mojo(
     model,
     input_ids,
@@ -471,6 +673,7 @@ def forward_cp_prefill_minibatch_mojo(
     local_shard_end,
     max_seq_len,
     use_attn_metadata=True,
+    return_all_hidden=False,
 ):
     total_batch = input_ids.shape[0]
     local_batch = local_shard_end - local_shard_start
@@ -483,6 +686,7 @@ def forward_cp_prefill_minibatch_mojo(
         )
     logits_chunks = []
     hidden_chunks = []
+    all_hidden_chunks = []
     for global_batch_idx in range(total_batch):
         owns_sample = local_shard_start <= global_batch_idx < local_shard_end
         minibatch_runtime = DeepseekSparseAttentionRuntimeState.from_model(
@@ -498,6 +702,10 @@ def forward_cp_prefill_minibatch_mojo(
             runtime_state=minibatch_runtime,
             use_attn_metadata=use_attn_metadata,
         )
+        if return_all_hidden:
+            if hidden_states is None:
+                raise RuntimeError("CP prefill did not return hidden_states required by MTP.")
+            all_hidden_chunks.append(hidden_states)
         if owns_sample:
             local_slot = global_batch_idx - local_shard_start
             _copy_paged_dummy_cache_batch(
@@ -516,6 +724,9 @@ def forward_cp_prefill_minibatch_mojo(
             f"owner_range=[{local_shard_start}, {local_shard_end}), total_batch={total_batch}"
         )
     hidden_out = torch.cat(hidden_chunks, dim=0) if hidden_chunks else None
+    if return_all_hidden:
+        all_hidden_out = torch.cat(all_hidden_chunks, dim=0) if all_hidden_chunks else None
+        return torch.cat(logits_chunks, dim=0), runtime_state.paged_cache, hidden_out, all_hidden_out
     return torch.cat(logits_chunks, dim=0), runtime_state.paged_cache, hidden_out
 
 
@@ -643,12 +854,12 @@ def forward_mtp_decode_mojo(
 
 
 def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_size=1, batch_size=1, graph_mode="eager", prof=False,
-             use_attn_metadata=True, mtp_model=None, mtp_runtime_state=None, next_n=0):
+             use_attn_metadata=True, mtp_model=None, mtp_runtime_state=None, next_n=0, prof_prefill=False):
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     os.environ["MOJO_BUILD_LEGACY_ATTN_INPUTS"] = "0" if use_attn_metadata else "1"
 
-    use_mtp = next_n > 0 and mtp_model is not None and mtp_runtime_state is not None
+    use_mtp = next_n > 0 and mtp_model is not None
     spec_len = next_n + 1  # speculative length = next_n + 1
 
     if dist.is_initialized():
@@ -658,6 +869,11 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
 
     is_main = (global_rank == 0)
     moe_ep_group = getattr(model, 'moe_ep_group', None)
+    sync_mtp_tokens_across_ep = (
+        ep_size > 1
+        and dist.is_initialized()
+        and model.__class__.__name__ != "DeepseekV4ForCausalLM"
+    )
     lmhead_tp_size = getattr(model, "lmhead_tp_size", 1)
     attn_tp_size = getattr(model, "attn_tp_size", 1)
     shard_start = 0
@@ -705,6 +921,17 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
     else:
         input_ids, attention_mask, lengths = full_input_ids, full_attention_mask, full_lengths
 
+    if use_mtp:
+        runtime_batch_size = getattr(getattr(mtp_runtime_state, "paged_cache", None), "batch_size", None)
+        if runtime_batch_size != batch_size:
+            mtp_runtime_state = DeepseekMTPRuntimeState.from_model(
+                mtp_model,
+                batch_size=batch_size,
+                device=device,
+                max_seq_len=4096,
+                next_n=next_n,
+            )
+
     _mem_snapshot("after input preparation")
 
     should_print = is_main
@@ -721,12 +948,11 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
         )
         for i in range(batch_size):
             print(f"\n[Batch {shard_start + i}] Prompt: {prompts[i]}")
-            print(f"  Rendered prefix: {repr(rendered[i][:200])}")
-            print(f"  Input length: {lengths[i].item()}")
         print(f"Graph mode: {graph_mode}")
         print(f"Use attn_metadata: {use_attn_metadata}")
         if use_mtp:
             print(f"MTP enabled: next_n={next_n}, spec_len={spec_len}")
+            print(f"[MTP] Runtime local batch_size={batch_size}")
         print("-" * 40)
 
     torch.npu.reset_peak_memory_stats()
@@ -736,6 +962,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
     decode_fn = None
     mtp_decode_fn = None
     mtp_decode_fns = None
+    enable_main_cache_compile = graph_mode == "npugraph_ex" and use_mtp
     enable_mtp_cache_compile = graph_mode == "npugraph_ex" and use_mtp and next_n == 1
     main_decode_graph_warmed = False
     mtp_decode_graph_warmed = False
@@ -757,7 +984,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
             decode_fn = compile_deepseek_v4_decode(
                 model,
                 graph_mode,
-                enable_cache_compile=enable_mtp_cache_compile,
+                enable_cache_compile=enable_main_cache_compile,
                 cache_name=f"main_decode_hidden_next{next_n}" if use_mtp else "main_decode",
             )
             if use_mtp:
@@ -783,15 +1010,32 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                 print(f"[GRAPH] Decode graph callable prepared in {time.time() - compile_t0:.2f}s (actual compilation happens on first call)")
 
     # ==================== Prefill ====================
+    prefill_prof_ctx = None
+    if prof_prefill and is_main:
+        import torch_npu.profiler as prof_mod
+        prefill_prof_dir = os.getenv(
+            "MOJO_PROF_PREFILL_DIR",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "profiling_prefill"),
+        )
+        prefill_prof_ctx = prof_mod.profile(
+            activities=[prof_mod.ProfilerActivity.CPU, prof_mod.ProfilerActivity.NPU],
+            on_trace_ready=prof_mod.tensorboard_trace_handler(prefill_prof_dir),
+            record_shapes=True,
+            with_stack=False,
+            with_flops=True,
+        )
+        prefill_prof_ctx.__enter__()
+        print(f"[PROF] Start profiling prefill, output -> {prefill_prof_dir}", flush=True)
+
     with torch.no_grad():
+        prev_hidden_all_for_mtp = None
         use_cp_minibatch_prefill = (
             model.__class__.__name__ == "DeepseekV4ForCausalLM"
             and runtime_state is not None
             and cp_size > 1
-            and full_input_ids.shape[0] > 1
         )
         if use_cp_minibatch_prefill:
-            next_token_logits, past_key_values, prev_hidden = forward_cp_prefill_minibatch_mojo(
+            cp_prefill_out = forward_cp_prefill_minibatch_mojo(
                 model,
                 full_input_ids,
                 full_attention_mask,
@@ -801,7 +1045,12 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                 local_shard_end=shard_end,
                 max_seq_len=max(input_ids.shape[1] * 4, 4096),
                 use_attn_metadata=use_attn_metadata,
+                return_all_hidden=use_mtp,
             )
+            if use_mtp:
+                next_token_logits, past_key_values, prev_hidden, prev_hidden_all_for_mtp = cp_prefill_out
+            else:
+                next_token_logits, past_key_values, prev_hidden = cp_prefill_out
         else:
             next_token_logits, past_key_values, prev_hidden = forward_prefill_mojo(
                 model, input_ids, attention_mask, lengths, runtime_state=runtime_state,
@@ -809,10 +1058,25 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
             )
         if not use_mtp:
             prev_hidden = None
+
+    if prefill_prof_ctx is not None:
+        prefill_prof_ctx.__exit__(None, None, None)
+        prefill_prof_ctx = None
+        print(f"[PROF] Prefill profiling done, output -> {prefill_prof_dir}", flush=True)
+
     _mem_snapshot("after prefill")
 
     # Sample first token (greedy)
     next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)  # [B, 1]
+    if use_mtp and cp_size > 1 and model.__class__.__name__ == "DeepseekV4ForCausalLM":
+        full_next_token_id = gather_decode_shard_tensor(
+            next_token_id,
+            full_input_ids.shape[0],
+            shard_start,
+            attn_dp_size,
+        )
+    else:
+        full_next_token_id = next_token_id
 
     if dist.is_initialized() and model.__class__.__name__ != "DeepseekV4ForCausalLM":
         if lmhead_tp_size > 1:
@@ -841,40 +1105,65 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
         # Following note:: after main model prefill, append next_token to generate_ids,
         # then MTP prefill uses generate_ids[:, 1:] as input_ids and main_hidden as prev_hidden_states.
         # This means MTP sees the next_token that main model just sampled.
-        confirmed_generate_ids = torch.cat([input_ids, next_token_id], dim=-1).contiguous()  # [B, S+1]
+        mtp_prefill_source_input_ids = full_input_ids if cp_size > 1 else input_ids
+        mtp_prefill_source_attention_mask = full_attention_mask if cp_size > 1 else attention_mask
+        mtp_prefill_next_token_id = full_next_token_id if cp_size > 1 else next_token_id
+        mtp_input_ids, mtp_attention_mask, confirmed_generate_ids_full = build_mtp_prefill_inputs(
+            mtp_prefill_source_input_ids,
+            mtp_prefill_source_attention_mask,
+            mtp_prefill_next_token_id,
+            pad_token_id,
+        )
+        if cp_size > 1:
+            confirmed_generate_ids = confirmed_generate_ids_full[shard_start:shard_end]
+            mtp_prev_hidden_for_prefill = prev_hidden_all_for_mtp
+        else:
+            confirmed_generate_ids = confirmed_generate_ids_full
+            mtp_prev_hidden_for_prefill = prev_hidden  # [B, S, H] (all positions from main model)
         mtp_generate_ids = confirmed_generate_ids
-        mtp_input_ids = mtp_generate_ids[:, 1:]  # [B, S] (skip BOS, includes next_token)
-        mtp_prev_hidden_for_prefill = prev_hidden  # [B, S, H] (all positions from main model)
 
         with torch.no_grad():
-            if ep_size > 1 and dist.is_initialized():
+            if sync_mtp_tokens_across_ep:
                 mtp_input_ids = mtp_input_ids.contiguous()
                 dist.broadcast(mtp_input_ids, src=0, group=moe_ep_group)
-            mtp_prefill_meta = mtp_runtime_state.prepare_prefill_inputs(
-                mtp_input_ids, attention_mask=None,
-                q_lens=torch.full((batch_size,), mtp_input_ids.shape[1], dtype=torch.int32, device=device),
-            )
-            mtp_out = mtp_model(
-                hidden_states=mtp_prev_hidden_for_prefill,
-                position_ids=mtp_prefill_meta["position_ids"],
-                past_key_values=mtp_runtime_state.paged_cache,
-                use_cache=True,
-                is_prefill=True,
-                attn_inputs=mtp_prefill_meta["attn_inputs"],
-                context_lens=mtp_prefill_meta["context_lens"],
-                q_lens=mtp_prefill_meta["q_lens"],
-                input_ids=mtp_input_ids,
-                return_hidden=True,
-            )
+                mtp_attention_mask = mtp_attention_mask.contiguous()
+                dist.broadcast(mtp_attention_mask, src=0, group=moe_ep_group)
+            if cp_size > 1:
+                mtp_out = forward_mtp_cp_prefill_minibatch_mojo(
+                    mtp_model,
+                    mtp_prev_hidden_for_prefill,
+                    mtp_input_ids,
+                    mtp_attention_mask,
+                    mtp_runtime_state,
+                    local_shard_start=shard_start,
+                    local_shard_end=shard_end,
+                    max_seq_len=max(input_ids.shape[1] * 4, 4096),
+                    next_n=next_n,
+                    use_attn_metadata=use_attn_metadata,
+                )
+            else:
+                mtp_out = forward_mtp_prefill_mojo(
+                    mtp_model,
+                    mtp_prev_hidden_for_prefill,
+                    mtp_input_ids,
+                    mtp_attention_mask,
+                    mtp_runtime_state,
+                    max_seq_len=max(input_ids.shape[1] * 4, 4096),
+                    next_n=next_n,
+                    use_attn_metadata=use_attn_metadata,
+                )
             mtp_logits, _, mtp_hidden = mtp_out
 
         # Sample first spec token
         mtp_spec_token = torch.argmax(mtp_logits, dim=-1)[:, -1:]  # [B, 1]
-        if ep_size > 1 and dist.is_initialized():
+        if sync_mtp_tokens_across_ep:
             mtp_spec_token = mtp_spec_token.contiguous()
             dist.broadcast(mtp_spec_token, src=0, group=moe_ep_group)
         mtp_spec_tokens = mtp_spec_token
-        confirmed_prev_hidden = prev_hidden[:, -spec_len:, :].contiguous()
+        if cp_size > 1:
+            confirmed_prev_hidden = mtp_hidden[:, -spec_len:, :].contiguous()
+        else:
+            confirmed_prev_hidden = prev_hidden[:, -spec_len:, :].contiguous()
         # Update prev_hidden for next MTP step: keep last spec_len positions
         mtp_prev_hidden = mtp_hidden[:, -spec_len:, :].contiguous().reshape(batch_size, spec_len, -1)  # [B, spec_len, H]
         # Note: mtp_generate_ids already contains next_token_id,
@@ -884,7 +1173,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
 
         # For next_n > 1, run additional MTP decode steps
         mtp_decode_input_ids = torch.cat(
-            [mtp_input_ids[:, -(spec_len - 1):], mtp_spec_token],
+            [mtp_generate_ids[:, -(spec_len - 1):], mtp_spec_token],
             dim=-1,
         ).contiguous()
         for _mtp_step in range(1, next_n):
@@ -920,11 +1209,9 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
         # Feed [next_token + spec_tokens] to main model in next iteration
         input_ids = torch.cat([next_token_id, mtp_spec_tokens], dim=-1)  # [B, spec_len]
 
-        # CRITICAL: Broadcast mtp_spec_tokens to all ranks to ensure consistency.
-        # MTP model uses EP, so different ranks may produce different spec tokens.
-        # If input_ids are inconsistent across ranks, npu_moe_distribute_dispatch_v2
-        # will deadlock (manifests as aicore timeout 507014).
-        if ep_size > 1 and dist.is_initialized():
+        # Keep token sync opt-in for legacy EP-only paths. DeepSeekV4 DP shards
+        # carry different samples and must not broadcast rank0 draft tokens.
+        if sync_mtp_tokens_across_ep:
             dist.broadcast(input_ids, src=0, group=moe_ep_group)
         if is_main:
             print(f"[MTP] Prefill: generated {mtp_spec_tokens.shape[-1]} spec token(s)")
@@ -1012,7 +1299,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
             if use_mtp and mtp_spec_tokens is not None:
                 # all_logits: [B, spec_len, V], main_hidden: [B, spec_len, H]
                 main_greedy = torch.argmax(all_logits, dim=-1)  # [B, spec_len]
-                if ep_size > 1 and dist.is_initialized():
+                if sync_mtp_tokens_across_ep:
                     main_greedy = main_greedy.contiguous()
                     dist.broadcast(main_greedy, src=0, group=moe_ep_group)
 
@@ -1028,9 +1315,9 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                 if is_main and step < 3:
                     print(f"[MTP DEBUG step={step}] spec_tokens={mtp_spec_tokens[0].tolist()}, main_greedy={main_greedy[0, :next_n].tolist()}, accepted={accepted_num[0].item()}", flush=True)
 
-                # CRITICAL: Broadcast accepted_num to ensure all ranks have consistent values
-                # Different ranks may compute different accepted_num due to MTP output differences
-                if ep_size > 1 and dist.is_initialized():
+                # Some legacy EP-only paths require token sync; DeepSeekV4 DP shards must keep
+                # per-rank tokens independent to avoid all samples following rank0.
+                if sync_mtp_tokens_across_ep:
                     accepted_num = accepted_num.contiguous()
                     dist.broadcast(accepted_num, src=0, group=moe_ep_group)
 
@@ -1058,7 +1345,7 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                     [main_greedy[row, accepted_num[row].item()] for row in range(batch_size)], dim=0
                 ).unsqueeze(-1)  # [B, 1]
 
-                if ep_size > 1 and dist.is_initialized():
+                if sync_mtp_tokens_across_ep:
                     next_token_id = next_token_id.contiguous()
                     dist.broadcast(next_token_id, src=0, group=moe_ep_group)
 
@@ -1100,10 +1387,9 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                 for mtp_step_idx in range(next_n):
                     with torch.no_grad():
                         # MTP decode: input_ids = [B, spec_len], prev_hidden = [B, spec_len, H]
-                        # CRITICAL: Broadcast mtp_input_ids and mtp_prev_hidden to all ranks
-                        # to ensure EP communication consistency in MoE dispatch/combine.
-                        # Different ranks may have different mtp_prev_hidden due to EP mode.
-                        if ep_size > 1 and dist.is_initialized():
+                        # Keep token sync opt-in for legacy EP-only paths. DeepSeekV4 DP shards
+                        # carry different samples and must not broadcast rank0 inputs.
+                        if sync_mtp_tokens_across_ep:
                             mtp_decode_input_ids = mtp_decode_input_ids.contiguous().reshape(batch_size, spec_len)
                             dist.broadcast(mtp_decode_input_ids, src=0, group=moe_ep_group)
                         current_mtp_decode_fn = (
@@ -1149,8 +1435,8 @@ def generate(model, tokenizer, prompt, max_new_tokens, device, ep_size=1, cp_siz
                 # Feed [next_token + spec_tokens] to main model
                 input_ids = torch.cat([next_token_id, mtp_spec_tokens], dim=-1)  # [B, spec_len]
 
-                # CRITICAL: Broadcast input_ids to all ranks (same reason as prefill broadcast)
-                if ep_size > 1 and dist.is_initialized():
+                # Keep token sync opt-in for legacy EP-only paths.
+                if sync_mtp_tokens_across_ep:
                     input_ids = input_ids.contiguous()
                     dist.broadcast(input_ids, src=0, group=moe_ep_group)
             else:
@@ -1205,6 +1491,8 @@ def parse_args():
                         help="Batch size for inference (default: 1, single-batch)")
     parser.add_argument("--prof", action="store_true", default=bool(int(os.getenv("MOJO_PROF", "0"))),
                         help="Enable NPU profiling for decode")
+    parser.add_argument("--prof_prefill", action="store_true", default=bool(int(os.getenv("MOJO_PROF_PREFILL", "0"))),
+                        help="Enable NPU profiling for prefill")
     parser.add_argument("--graph_mode", type=str, default=os.getenv("MOJO_GRAPH_MODE", "eager"),
                         choices=["eager", "npugraph_ex", "ge_graph"], help="Graph compilation mode for decode")
     parser.add_argument("--use_attn_metadata", type=int, choices=[0, 1],
@@ -1229,10 +1517,22 @@ def main():
     o_proj_tp_size = args.o_proj_tp_size
     if world_size > 1 and lmhead_tp_size > 1 and world_size % lmhead_tp_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must be divisible by LMHEAD_TP_SIZE={lmhead_tp_size}")
-    if world_size > 1 and world_size % (attn_tp_size * max(cp_size, 1)) != 0:
+    if world_size > 1 and world_size % attn_tp_size != 0:
         raise ValueError(
-            "WORLD_SIZE must be divisible by ATTN_TP_SIZE * CP_SIZE, got "
-            f"WORLD_SIZE={world_size}, ATTN_TP_SIZE={attn_tp_size}, CP_SIZE={cp_size}"
+            "WORLD_SIZE must be divisible by ATTN_TP_SIZE, got "
+            f"WORLD_SIZE={world_size}, ATTN_TP_SIZE={attn_tp_size}"
+        )
+    if cp_size > 1 and cp_size != world_size:
+        raise ValueError(
+            "Golden-style CP requires CP_SIZE == WORLD_SIZE when CP is enabled, got "
+            f"CP_SIZE={cp_size}, WORLD_SIZE={world_size}"
+        )
+    prefill_dp_size = world_size // max(cp_size, 1) // attn_tp_size
+    if cp_size > 1 and prefill_dp_size < 1:
+        raise ValueError(
+            "Invalid Golden-style CP prefill parallel config: "
+            f"prefill_dp_size={prefill_dp_size}, WORLD_SIZE={world_size}, "
+            f"CP_SIZE={cp_size}, ATTN_TP_SIZE={attn_tp_size}"
         )
     npu_device_idx = int(os.getenv("NPU_DEVICE_IDX", local_rank))
 
@@ -1272,10 +1572,12 @@ def main():
         logger.info("[CONFIG] DeepSeek-V4 runtime config: pa_max_length=%s next_n=%s", args.pa_max_length, args.next_n)
 
         ep_rank = global_rank % ep_size if ep_size > 1 else 0
-        attn_dp_size = world_size // (attn_tp_size * max(cp_size, 1))
+        attn_dp_size = world_size // attn_tp_size
+        prefill_dp_size = world_size // max(cp_size, 1) // attn_tp_size
         parallel_config = {
             "cp_size": cp_size,
             "attn_dp_size": attn_dp_size,
+            "prefill_dp_size": prefill_dp_size,
             "attn_tp_size": attn_tp_size,
             "lmhead_tp_size": lmhead_tp_size,
             "o_proj_tp_size": o_proj_tp_size,
@@ -1423,6 +1725,13 @@ def main():
         # Share embed_tokens and lm_head from main model to MTP model
         mtp_model.model.embed_tokens = model.model.embed_tokens
         mtp_model.lm_head = model.lm_head
+        mtp_model.attn_dp_size = getattr(model, "attn_dp_size", 1)
+        mtp_model.prefill_dp_size = getattr(model, "prefill_dp_size", 1)
+        mtp_model.lmhead_tp_size = getattr(model, "lmhead_tp_size", 1)
+        mtp_model.local_vocab_size = getattr(model, "local_vocab_size", model.config.vocab_size)
+        mtp_model.cp_size = getattr(model, "cp_size", cp_size)
+        mtp_model.global_rank = getattr(model, "global_rank", global_rank)
+        mtp_model.hccl_comm_dict = model.hccl_comm_dict.copy()
 
         DeepseekV4ForMTP.load_weights(mtp_model, args.model_path, main_model=model)
         _mem_snapshot("after MTP load_weights", npu_device_idx)
@@ -1432,7 +1741,6 @@ def main():
             # Creating independent comm groups via dist.new_group() causes HCCL communication mismatch
             # between MTP and main model, leading to npu_moe_distribute_dispatch_v2 aicore timeout (507014).
             # This matches note: behavior where comm groups are implicitly shared via caching.
-            mtp_model.hccl_comm_dict = model.hccl_comm_dict.copy()
             mtp_model.set_ep_group()
             # Only smooth_scale_1 needs all_gather (used by moe_init_routing_v2 before all_to_all,
             # indexed by global expert_num=256). smooth_scale_2 must stay local [experts_per_rank, ...]
@@ -1451,21 +1759,15 @@ def main():
                             group=moe_ep_group)
                         mlp.smooth_scale_1.data = all_smooth_scale_1
 
-        mtp_runtime_state = DeepseekMTPRuntimeState.from_model(
-            mtp_model,
-            batch_size=args.batch_size,
-            device=f"npu:{npu_device_idx}",
-            max_seq_len=4096,
-            next_n=next_n,
-        )
         if is_main:
-            print("[MTP] MTP model and runtime state created")
+            print("[MTP] MTP model created; runtime state will be created after local batch sharding")
 
     generate(
         model, tokenizer, args.prompt, args.max_new_tokens, f"npu:{npu_device_idx}",
         ep_size=ep_size, cp_size=cp_size, batch_size=args.batch_size, graph_mode=args.graph_mode, prof=args.prof,
         use_attn_metadata=bool(args.use_attn_metadata),
         mtp_model=mtp_model, mtp_runtime_state=mtp_runtime_state, next_n=next_n,
+        prof_prefill=args.prof_prefill,
     )
 
     if dist.is_initialized():

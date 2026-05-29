@@ -98,7 +98,7 @@ cleanup_child_processes() {
 }
 
 PIDS=()
-trap cleanup_child_processes EXIT INT TERM
+# trap cleanup_child_processes EXIT INT TERM
 
 MODEL_PATH="${1:-$DEFAULT_LOCAL_PATH}"
 
@@ -108,7 +108,7 @@ if [ ! -d "$MODEL_PATH" ]; then
 fi
 
 echo "Running inference with model at: ${MODEL_PATH}"
-cleanup_stale_processes
+# cleanup_stale_processes
 
 if ! "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
     echo "Current python cannot import torch: ${PYTHON_BIN}"
@@ -204,7 +204,7 @@ else
     for pid in "${PIDS[@]}"; do
         if ! wait "$pid"; then
             echo "Process $pid exited with error"
-            cleanup_child_processes
+            # cleanup_child_processes
             exit 1
         fi
     done

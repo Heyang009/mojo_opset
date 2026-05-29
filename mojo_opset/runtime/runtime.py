@@ -299,10 +299,14 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
 
     def _get_first_layer_for_ratio(self, ratio):
         for layer_idx in range(self.paged_cache.num_layers):
-            layer_ratio = self.config.compress_ratios[layer_idx] if layer_idx < len(self.config.compress_ratios) else 0
+            compress_ratios = self._metadata_compress_ratios()
+            layer_ratio = compress_ratios[layer_idx] if layer_idx < len(compress_ratios) else 0
             if layer_ratio == ratio:
                 return layer_idx
         return None
+
+    def _metadata_compress_ratios(self):
+        return self.config.compress_ratios
 
     def _get_cp_rank(self, cp_group) -> int:
         if cp_group is None or not dist.is_initialized():
@@ -558,7 +562,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         attn_metadata["prev"] = {}
         attn_metadata["next"] = {}
 
-        ratios = sorted({r for r in self.config.compress_ratios if r > 1})
+        ratios = sorted({r for r in self._metadata_compress_ratios() if r > 1})
         for zigzag_flag in ["prev", "next"]:
             segment_idx = cp_rank if zigzag_flag == "prev" else 2 * self.cp_size - 1 - cp_rank
             cur_position_ids = split_position_ids[segment_idx]
@@ -766,8 +770,9 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         # pollutes the tail window handed to decode.
         current_seq_lens = q_lens.to(dtype=torch.int32)
 
+        compress_ratios = self._metadata_compress_ratios()
         unique_ratios = sorted(set(
-            self.config.compress_ratios[l] if l < len(self.config.compress_ratios) else 0
+            compress_ratios[l] if l < len(compress_ratios) else 0
             for l in range(pkv.num_layers)
         ))
         shared_metadata = {}
@@ -809,7 +814,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         if os.getenv("MOJO_BUILD_LEGACY_ATTN_INPUTS", "0") == "1":
             attn_inputs = {}
             for layer_idx in range(pkv.num_layers):
-                ratio = self.config.compress_ratios[layer_idx] if layer_idx < len(self.config.compress_ratios) else 0
+                ratio = compress_ratios[layer_idx] if layer_idx < len(compress_ratios) else 0
                 attn_inputs[layer_idx] = self._prepare_layer_prefill_inputs(
                     layer_idx, ratio, context_lens, q_lens, cu_q_lens,
                     start_pos, seq_used_q, batch_size, seq_len, device,
@@ -1026,7 +1031,6 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
         seq_used_q = q_lens
 
         win_slot_mapping = pkv.get_win_slot_mapping(start_pos, seq_used_q)
-        kv_slot_mapping = pkv.get_all_kv_slot_mapping(start_pos, seq_used_q, seq_len)
 
         unique_ratios = sorted(set(
             self.config.compress_ratios[l] if l < len(self.config.compress_ratios) else 0
@@ -1062,7 +1066,7 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             seq_used_q=seq_used_q,
             shared_metadata=shared_metadata,
             win_slot_mapping=win_slot_mapping,
-            kv_slot_mapping=kv_slot_mapping,
+            full_kv_cache=None,
             is_prefill=False,
             batch_size=batch_size,
             decode_fast_path=False,
@@ -1221,21 +1225,40 @@ class DeepseekSparseAttentionRuntimeState(MojoSession):
             return None
 
 
-class DeepseekMTPRuntimeState(MojoSession):
+class DeepseekMTPRuntimeState(DeepseekSparseAttentionRuntimeState):
     """Runtime state for DeepSeek-V4 MTP model.
 
     Uses a PagedDummyCache with only 1 layer (the MTP layer).
     Shares the same config as the main model but operates on a single layer.
     """
 
-    def __init__(self, paged_cache, config, mtp_layer_idx):
-        self.paged_cache = paged_cache
-        self.config = config
+    def __init__(self, paged_cache, config, mtp_layer_idx, cp_size=1, global_rank=0, hccl_comm_dict=None):
+        super().__init__(
+            paged_cache,
+            config,
+            cp_size=cp_size,
+            global_rank=global_rank,
+            hccl_comm_dict=hccl_comm_dict,
+        )
         self.mtp_layer_idx = mtp_layer_idx
 
     @property
     def kv_cache(self):
         return self.paged_cache
+
+    def _metadata_compress_ratios(self):
+        return self.paged_cache.config.compress_ratios
+
+    def _get_first_layer_for_ratio(self, ratio):
+        for layer_idx in range(self.paged_cache.num_layers):
+            layer_ratio = (
+                self.paged_cache.config.compress_ratios[layer_idx]
+                if layer_idx < len(self.paged_cache.config.compress_ratios)
+                else 0
+            )
+            if layer_ratio == ratio:
+                return layer_idx
+        return None
 
     @classmethod
     def from_model(
@@ -1290,59 +1313,27 @@ class DeepseekMTPRuntimeState(MojoSession):
             pa_max_length=pa_max_length,
             next_n=next_n,
         )
-        return cls(cache_data, config, mtp_layer_idx)
+        return cls(
+            cache_data,
+            config,
+            mtp_layer_idx,
+            cp_size=getattr(mtp_model, "cp_size", 1),
+            global_rank=getattr(mtp_model, "global_rank", 0),
+            hccl_comm_dict=getattr(mtp_model, "hccl_comm_dict", {}),
+        )
 
     def prepare_prefill_inputs(self, input_ids, attention_mask=None, q_lens=None):
         """Prepare prefill inputs for MTP model.
 
         MTP model receives hidden_states from main model, not raw input_ids.
-        This method prepares the attn_inputs for the MTP layer.
+        Reuse the Golden-style main runtime path so CP prefill also gets
+        cp_metadata/prev/next branches and full/window slot mappings.
         """
-        pkv = self.paged_cache
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-
-        if q_lens is None:
-            if attention_mask is not None:
-                q_lens = attention_mask.to(device=device, dtype=torch.int32).sum(dim=-1).to(dtype=torch.int32)
-            else:
-                q_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-
-        context_lens = pkv.get_seq_length(0).to(device=device, dtype=torch.long)
-        if attention_mask is not None:
-            position_ids = (attention_mask.to(device=device, dtype=torch.long).cumsum(dim=-1) - 1).clamp(min=0)
-            position_ids = position_ids.masked_fill(~attention_mask.to(device=device, dtype=torch.bool), 1)
-        else:
-            past_len = int(context_lens.max().item()) if context_lens.numel() > 0 else 0
-            position_ids = torch.arange(past_len, past_len + seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-
-        cu_q_lens = torch.arange(
-            0, (batch_size + 1) * seq_len, step=seq_len,
-            dtype=torch.int32, device=device,
+        return super().prepare_prefill_inputs(
+            input_ids,
+            attention_mask=attention_mask,
+            q_lens=q_lens,
         )
-        start_pos = context_lens.to(dtype=torch.int32)
-        seq_used_q = q_lens
-        current_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-
-        # MTP layer uses layer_idx=0 in its own cache
-        layer_idx = 0
-        ratio = self.config.compress_ratios[self.mtp_layer_idx] if self.mtp_layer_idx < len(self.config.compress_ratios) else 0
-
-        attn_inputs = {0: self._prepare_layer_inputs(
-            layer_idx, ratio, context_lens, q_lens, cu_q_lens,
-            start_pos, seq_used_q, batch_size, seq_len, device,
-            is_prefill=True,
-        )}
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "context_lens": context_lens,
-            "cu_q_lens": cu_q_lens,
-            "q_lens": q_lens,
-            "attn_inputs": attn_inputs,
-        }
 
     def prepare_decode_inputs(self, input_ids):
         """Prepare decode inputs for MTP model."""
@@ -1364,7 +1355,8 @@ class DeepseekMTPRuntimeState(MojoSession):
         win_slot_mapping = pkv.get_win_slot_mapping(context_lens, q_lens)
 
         layer_idx = 0
-        ratio = self.config.compress_ratios[self.mtp_layer_idx] if self.mtp_layer_idx < len(self.config.compress_ratios) else 0
+        compress_ratios = self._metadata_compress_ratios()
+        ratio = compress_ratios[layer_idx] if layer_idx < len(compress_ratios) else 0
 
         attn_inputs = {0: self._prepare_layer_inputs(
             layer_idx, ratio, context_lens, q_lens, cu_q_lens,
@@ -1515,6 +1507,17 @@ class DeepseekMTPRuntimeState(MojoSession):
 
     def _compute_kv_slot_mapping(self, layer_idx, context_lens, seq_len):
         pkv = self.paged_cache
+        if hasattr(pkv, "get_kv_slot_mapping"):
+            slot_mapping = pkv.get_kv_slot_mapping(
+                layer_idx,
+                context_lens,
+                torch.full_like(context_lens, seq_len, dtype=torch.int32),
+                seq_len,
+            )
+            if slot_mapping is not None:
+                return slot_mapping
+        if not hasattr(pkv, "block_tables"):
+            return None
         batch_size = context_lens.shape[0]
         device = context_lens.device
         positions = context_lens.to(torch.int32).unsqueeze(1) + torch.arange(

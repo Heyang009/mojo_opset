@@ -2961,7 +2961,7 @@ class DeepseekV4MTPLayer(nn.Module):
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
                 use_cache=None, is_prefill=True, context_lens=None, attn_inputs=None,
-                q_lens=None, input_ids=None, mtp_layer_idx=0, **kwargs):
+                attn_metadata=None, q_lens=None, input_ids=None, mtp_layer_idx=0, **kwargs):
         # hidden_states = prev_hidden_states [B, S, H] from main model
         # input_ids [B, S] for computing embeddings via embed_tokens
         #
@@ -2973,6 +2973,16 @@ class DeepseekV4MTPLayer(nn.Module):
         position_embeddings = None
         if input_ids is not None and hasattr(self, 'embed_tokens') and self.embed_tokens is not None:
             embed_states = self.embed_tokens(input_ids)  # [B, S, H] raw embedding
+            if is_prefill and attn_metadata is not None and attn_metadata.get("cp_metadata") is not None:
+                split_list = attn_metadata["cp_metadata"]["split_list"]
+                zigzag_idx = attn_metadata["cp_metadata"]["zigzag_idx"]
+                embed_segments = embed_states.split(split_list, dim=1)
+                input_segments = input_ids.split(split_list, dim=1)
+                embed_states = torch.cat([embed_segments[idx] for idx in zigzag_idx], dim=1)
+                input_ids = torch.cat([input_segments[idx] for idx in zigzag_idx], dim=1)
+                if position_ids is not None:
+                    pos_segments = position_ids.split(split_list, dim=1)
+                    position_ids = torch.cat([pos_segments[idx] for idx in zigzag_idx], dim=1)
 
             # Compute RoPE on raw embedding, BEFORE enorm/hnorm (matching note:)
             if position_ids is not None and hasattr(self, 'rotary_emb'):
@@ -3013,6 +3023,7 @@ class DeepseekV4MTPLayer(nn.Module):
             position_ids=position_ids, past_key_values=past_key_values, use_cache=use_cache,
             input_ids=input_ids, is_prefill=is_prefill, context_lens=context_lens,
             attn_inputs=layer_attn_inputs,
+            attn_metadata=attn_metadata,
         )
         hidden_states = self._hc_head(hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -3032,20 +3043,29 @@ class DeepseekV4ForMTP(nn.Module):
         self.model = DeepseekV4MTPLayer(config, ep_size=ep_size, ep_rank=ep_rank)
         self.lm_head = None
         self.hccl_comm_dict = {}
+        self.cp_size = 1
+        self.global_rank = 0
+        self.attn_dp_size = 1
+        self.prefill_dp_size = 1
+        self.lmhead_tp_size = 1
+        self.local_vocab_size = config.vocab_size
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
                 use_cache=None, is_prefill=True, attn_inputs=None, context_lens=None,
-                q_lens=None, input_ids=None, mtp_layer_idx=0,
+                attn_metadata=None, q_lens=None, input_ids=None, mtp_layer_idx=0,
                 return_hidden=False, **kwargs):
         hidden_states, past_key_values = self.model(
             hidden_states, attention_mask=attention_mask, position_ids=position_ids,
             past_key_values=past_key_values, use_cache=use_cache, is_prefill=is_prefill,
-            attn_inputs=attn_inputs, context_lens=context_lens, q_lens=q_lens,
+            attn_inputs=attn_inputs, context_lens=context_lens, attn_metadata=attn_metadata, q_lens=q_lens,
             input_ids=input_ids, mtp_layer_idx=mtp_layer_idx,
         )
         if self.lm_head is not None:
             mtp_hidden = hidden_states  # hidden states before lm_head, for next MTP step
             if is_prefill:
+                if attn_metadata is not None and attn_metadata.get("cp_metadata") is not None:
+                    hidden_states = self._gather_cp_prefill_hidden_states(hidden_states, attn_metadata)
+                    mtp_hidden = hidden_states
                 if q_lens is not None:
                     gather_q_lens = q_lens
                 elif attention_mask is not None:
@@ -3055,9 +3075,42 @@ class DeepseekV4ForMTP(nn.Module):
                 if gather_q_lens is not None:
                     gather_index = (gather_q_lens - 1).unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
                     hidden_states = torch.gather(hidden_states, 1, gather_index)
-            hidden_states_flat = hidden_states.view(-1, self.config.hidden_size).to(torch.bfloat16)
-            logits = self.lm_head(hidden_states_flat)
-            logits = logits.view(*hidden_states.shape[:-1], self.config.vocab_size)
+            local_bs, q_len, hidden_size = hidden_states.shape
+            hidden_states_for_lm = hidden_states.view(local_bs * q_len, 1, hidden_size).to(torch.bfloat16)
+            lmhead_tp_group = self.hccl_comm_dict.get("lmhead_tp_group")
+            if self.attn_dp_size > 1 and self.lmhead_tp_size > 1 and lmhead_tp_group is not None and dist.is_initialized():
+                gathered_hidden = hidden_states_for_lm.new_empty(
+                    self.lmhead_tp_size * hidden_states_for_lm.shape[0],
+                    hidden_states_for_lm.shape[1],
+                    hidden_states_for_lm.shape[2],
+                )
+                dist.all_gather_into_tensor(
+                    gathered_hidden,
+                    hidden_states_for_lm.contiguous(),
+                    group=lmhead_tp_group,
+                )
+                hidden_states_for_lm = gathered_hidden
+
+            logits_flat = self.lm_head(hidden_states_for_lm.view(-1, hidden_size))
+            logits = logits_flat.view(*hidden_states_for_lm.shape[:-1], self.local_vocab_size)
+            if self.lmhead_tp_size > 1 and lmhead_tp_group is not None and dist.is_initialized():
+                if self.attn_dp_size == 1:
+                    gathered_logits = logits.new_empty(
+                        self.lmhead_tp_size * logits.shape[0],
+                        logits.shape[1],
+                        logits.shape[2],
+                    )
+                    dist.all_gather_into_tensor(gathered_logits, logits.contiguous(), group=lmhead_tp_group)
+                else:
+                    gathered_logits = logits.new_empty(logits.numel()).view(-1)
+                    dist.all_to_all_single(gathered_logits, logits.contiguous().view(-1), group=lmhead_tp_group)
+                    gathered_logits = gathered_logits.view_as(logits)
+
+                gathered_logits = gathered_logits.reshape(
+                    self.lmhead_tp_size, local_bs * q_len, logits.shape[1], -1
+                ).permute(1, 2, 0, 3)
+                logits = gathered_logits.reshape(local_bs * q_len, logits.shape[1], -1)[..., : self.config.vocab_size]
+            logits = logits.reshape(local_bs, q_len, -1)
             if return_hidden:
                 return logits, past_key_values, mtp_hidden
             return logits, past_key_values
@@ -3086,9 +3139,38 @@ class DeepseekV4ForMTP(nn.Module):
     def set_ep_group(self):
         moe_ep_group = self.hccl_comm_dict.get("moe_ep_group")
         self.moe_ep_group = moe_ep_group
+        self.model.hccl_comm_dict = self.hccl_comm_dict
         for layer_key, layer in self.model.layers.items():
             layer.mlp.ep_group = moe_ep_group
             layer.mlp.hccl_comm_dict = self.hccl_comm_dict
+            layer.self_attn.hccl_comm_dict = self.hccl_comm_dict
+            layer.self_attn.cp_size = self.cp_size
+            layer.self_attn.global_rank = self.global_rank
+            if layer.self_attn.sfa_compressor is not None:
+                layer.self_attn.sfa_compressor.cp_size = self.cp_size
+                layer.self_attn.sfa_compressor.global_rank = self.global_rank
+                layer.self_attn.sfa_compressor.hccl_comm_dict = self.hccl_comm_dict
+            if layer.self_attn.indexer is not None:
+                layer.self_attn.indexer.cp_size = self.cp_size
+                layer.self_attn.indexer.global_rank = self.global_rank
+                layer.self_attn.indexer.hccl_comm_dict = self.hccl_comm_dict
+
+    def _gather_cp_prefill_hidden_states(self, hidden_states: torch.Tensor, attn_metadata: dict) -> torch.Tensor:
+        cp_meta = attn_metadata.get("cp_metadata") if attn_metadata is not None else None
+        cp_group = self.hccl_comm_dict.get("cp_group")
+        if cp_meta is None or cp_group is None or self.cp_size <= 1:
+            return hidden_states
+        if hidden_states.shape[0] != 1:
+            raise NotImplementedError("MTP CP prefill currently expects minibatch size 1.")
+        local_seq = hidden_states.shape[1]
+        if local_seq % 2 != 0:
+            raise ValueError("MTP CP prefill expects local hidden states to split into prev/next evenly.")
+        segment_len = local_seq // 2
+        gathered = hidden_states.new_empty((self.cp_size, *hidden_states.shape))
+        dist.all_gather_into_tensor(gathered, hidden_states.contiguous(), group=cp_group)
+        gathered = gathered.view(self.cp_size * 2, hidden_states.shape[0], segment_len, hidden_states.shape[-1])
+        gathered = gathered[cp_meta["reverse_index"]]
+        return gathered.permute(1, 0, 2, 3).reshape(hidden_states.shape[0], -1, hidden_states.shape[-1])
 
     @staticmethod
     def load_weights(model, weight_dir, main_model=None):
@@ -3284,6 +3366,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.cp_size = int(self.parallel_config.get("cp_size", 1))
         self.attn_tp_size = int(self.parallel_config.get("attn_tp_size", 1))
         self.attn_dp_size = int(self.parallel_config.get("attn_dp_size", 1))
+        self.prefill_dp_size = int(self.parallel_config.get("prefill_dp_size", 1))
         self.lmhead_tp_size = int(self.parallel_config.get("lmhead_tp_size", 1))
         self.o_proj_tp_size = int(self.parallel_config.get("o_proj_tp_size", self.attn_tp_size))
         self.lmhead_tp_rank = global_rank % self.lmhead_tp_size if self.lmhead_tp_size > 1 else 0
@@ -3393,13 +3476,24 @@ class DeepseekV4ForCausalLM(nn.Module):
         world_size = dist.get_world_size()
         global_rank = dist.get_rank()
         self.global_rank = global_rank
-        attn_group_size = self.attn_tp_size * max(self.cp_size, 1)
-        if world_size % attn_group_size != 0:
+        if world_size % self.attn_tp_size != 0:
             raise ValueError(
-                "world_size must be divisible by attn_tp_size * cp_size, got "
-                f"world_size={world_size}, attn_tp_size={self.attn_tp_size}, cp_size={self.cp_size}"
+                "world_size must be divisible by attn_tp_size, got "
+                f"world_size={world_size}, attn_tp_size={self.attn_tp_size}"
             )
-        self.attn_dp_size = world_size // attn_group_size
+        if self.cp_size > 1 and self.cp_size != world_size:
+            raise ValueError(
+                "Golden-style CP requires cp_size == world_size when CP is enabled, got "
+                f"cp_size={self.cp_size}, world_size={world_size}"
+            )
+        self.attn_dp_size = world_size // self.attn_tp_size
+        self.prefill_dp_size = world_size // max(self.cp_size, 1) // self.attn_tp_size
+        if self.cp_size > 1 and self.prefill_dp_size < 1:
+            raise ValueError(
+                "Invalid Golden-style CP prefill parallel config: "
+                f"prefill_dp_size={self.prefill_dp_size}, world_size={world_size}, "
+                f"cp_size={self.cp_size}, attn_tp_size={self.attn_tp_size}"
+            )
         if self.cp_size > 1:
             self.hccl_comm_dict["cp_group"] = _create_contiguous_subgroup(
                 self.cp_size, global_rank, world_size
