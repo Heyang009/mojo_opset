@@ -66,6 +66,15 @@ def _swa_paged_prefill_autotune_configs() -> list[triton.Config]:
     ]
 
 
+def _swa_paged_prefill_quant_autotune_configs() -> list[triton.Config]:
+    return [
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ]
+
+
 @libentry()
 @triton.jit
 def _swa_masked_fwd_kernel(
@@ -1101,6 +1110,11 @@ def swa_infer_impl(
     return outputs
 
 
+@smart_triton_autotune(
+    configs=_swa_paged_prefill_quant_autotune_configs(),
+    selected_idx=1,
+    key=["HEAD_DIM", "PAGE_SIZE", "GLOBAL_WINDOW_SIZE", "LOCAL_WINDOW_SIZE", "NUM_Q_HEADS", "NUM_KV_HEADS"],
+)
 @triton.jit
 def _swa_paged_prefill_with_kv_dequant_kernel(
     Q,
@@ -1137,10 +1151,7 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
     Mirrors `_paged_prefill_with_kv_dequant_kernel` (commit 1130f65) but adds the SWA
     local / global window mask. Each program handles one
     (q_token_in_seq, q_head, batch) triple and walks all KV tokens linearly,
-    accumulating online-softmax stats in fp32. We deliberately avoid tl.dot
-    because the ILU triton compiler generates invalid bitcasts in the
-    SharedToDotOperand layout pass when tl.dot's data provenance is an int8
-    load.
+    accumulating online-softmax stats in fp32.
     """
     q_token_id = tl.program_id(0)
     q_head_id = tl.program_id(1)
@@ -1157,6 +1168,8 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
         kv_head_id = q_head_id % NUM_KV_HEADS
     else:
         kv_head_id = q_head_id // (NUM_Q_HEADS // NUM_KV_HEADS)
+    has_local_window = LOCAL_WINDOW_SIZE is not None
+    has_global_window = GLOBAL_WINDOW_SIZE is not None
 
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < HEAD_DIM
@@ -1167,11 +1180,11 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
     ).to(tl.float32)
 
     k_scale_vec = tl.load(
-        K_qscale + q_head_id * stride_ks_h + offs_d * stride_ks_d,
+        K_qscale + kv_head_id * stride_ks_h + offs_d * stride_ks_d,
         mask=d_mask, other=0.0,
     )
     v_scale_vec = tl.load(
-        V_qscale + q_head_id * stride_vs_h + offs_d * stride_vs_d,
+        V_qscale + kv_head_id * stride_vs_h + offs_d * stride_vs_d,
         mask=d_mask, other=0.0,
     )
 
@@ -1190,6 +1203,9 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
         q_rounded = tl.where(q_scaled_norm < 0, -q_rounded_abs, q_rounded_abs)
         q_rounded = tl.minimum(tl.maximum(q_rounded, -128.0), 127.0)
         q_quant = q_rounded.to(tl.int8).to(tl.float32)
+        dot_lane = tl.arange(0, 16)
+        dot_lane0 = (dot_lane == 0).to(tl.float32)
+        q_dot_mat = tl.where(dot_lane[None, :] == 0, q_quant[:, None], 0.0)
 
     # `kv_cache_len` = number of already-cached KV tokens that come BEFORE this
     # batch's prefill chunk. The j-th KV token corresponds to absolute
@@ -1223,17 +1239,17 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                 kv_mask = offs_n < kv_block_len
                 if IS_CAUSAL:
                     causal_ok = kv_pos <= abs_q_pos
-                    if (LOCAL_WINDOW_SIZE is None) and (GLOBAL_WINDOW_SIZE is None):
+                    if (not has_local_window) and (not has_global_window):
                         allowed = causal_ok
                     else:
-                        if LOCAL_WINDOW_SIZE is not None:
+                        if has_local_window:
                             local_ok = abs_q_pos <= kv_pos + LOCAL_WINDOW_SIZE
                         else:
-                            local_ok = False
-                        if GLOBAL_WINDOW_SIZE is not None:
+                            local_ok = tl.full((BLOCK_N,), False, tl.int1)
+                        if has_global_window:
                             global_ok = kv_pos < GLOBAL_WINDOW_SIZE
                         else:
-                            global_ok = False
+                            global_ok = tl.full((BLOCK_N,), False, tl.int1)
                         allowed = causal_ok & (local_ok | global_ok)
                 else:
                     allowed = True
@@ -1251,7 +1267,8 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                     order=(1, 0),
                 )
                 k_block = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-                qk = tl.sum(q_quant[None, :] * k_block, axis=1) * q_quant_scale * sm_scale
+                qk_mat = tl.dot(k_block, q_dot_mat).to(tl.float32)
+                qk = tl.sum(qk_mat * dot_lane0[None, :], axis=1) * q_quant_scale * sm_scale
                 qk = tl.where(mask, qk, -float("inf"))
                 m_max = tl.maximum(m_max, tl.max(qk, axis=0))
 
@@ -1271,17 +1288,17 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                 kv_mask = offs_n < kv_block_len
                 if IS_CAUSAL:
                     causal_ok = kv_pos <= abs_q_pos
-                    if (LOCAL_WINDOW_SIZE is None) and (GLOBAL_WINDOW_SIZE is None):
+                    if (not has_local_window) and (not has_global_window):
                         allowed = causal_ok
                     else:
-                        if LOCAL_WINDOW_SIZE is not None:
+                        if has_local_window:
                             local_ok = abs_q_pos <= kv_pos + LOCAL_WINDOW_SIZE
                         else:
-                            local_ok = False
-                        if GLOBAL_WINDOW_SIZE is not None:
+                            local_ok = tl.full((BLOCK_N,), False, tl.int1)
+                        if has_global_window:
                             global_ok = kv_pos < GLOBAL_WINDOW_SIZE
                         else:
-                            global_ok = False
+                            global_ok = tl.full((BLOCK_N,), False, tl.int1)
                         allowed = causal_ok & (local_ok | global_ok)
                 else:
                     allowed = True
@@ -1299,7 +1316,8 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                     order=(1, 0),
                 )
                 k_block = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-                qk = tl.sum(q_quant[None, :] * k_block, axis=1) * q_quant_scale * sm_scale
+                qk_mat = tl.dot(k_block, q_dot_mat).to(tl.float32)
+                qk = tl.sum(qk_mat * dot_lane0[None, :], axis=1) * q_quant_scale * sm_scale
                 p = tl.where(mask, tl.math.exp(qk - m_max), 0.0)
                 l_sum += tl.sum(p, axis=0)
 
@@ -1311,6 +1329,7 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                 p_rounded = tl.where(p_is_half & p_base_is_even, p_base, p_floor_round)
                 p_rounded = tl.minimum(tl.maximum(p_rounded, -128.0), 127.0)
                 p_quant = p_rounded.to(tl.int8).to(tl.float32)
+                p_dot_mat = tl.where(dot_lane[:, None] == 0, p_quant[None, :], 0.0)
 
                 v_block_ptr = tl.make_block_ptr(
                     base=V_cache
@@ -1324,7 +1343,8 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
                     order=(1, 0),
                 )
                 v_block = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
-                acc += tl.sum(p_quant[:, None] * v_block, axis=0)
+                acc_dot = tl.dot(p_dot_mat, v_block).to(tl.float32)
+                acc += tl.sum(acc_dot * dot_lane0[:, None], axis=0)
 
         l_sum = tl.maximum(l_sum, 1e-6)
         out_vec = acc * p_quant_scale * v_scale_vec / l_sum
@@ -1353,14 +1373,14 @@ def _swa_paged_prefill_with_kv_dequant_kernel(
             #            else just causal.
             if IS_CAUSAL:
                 causal_ok = j <= abs_q_pos
-                if (LOCAL_WINDOW_SIZE is None) and (GLOBAL_WINDOW_SIZE is None):
+                if (not has_local_window) and (not has_global_window):
                     allowed = causal_ok
                 else:
-                    if LOCAL_WINDOW_SIZE is not None:
+                    if has_local_window:
                         local_ok = abs_q_pos <= j + LOCAL_WINDOW_SIZE
                     else:
                         local_ok = False
-                    if GLOBAL_WINDOW_SIZE is not None:
+                    if has_global_window:
                         global_ok = j < GLOBAL_WINDOW_SIZE
                     else:
                         global_ok = False
@@ -1428,10 +1448,9 @@ def swa_paged_prefill_with_kv_dequant_impl(
     Args:
         q:               (T, Hq, D) bf16/fp16 query tokens.
         key_cache:       (N_blocks, Hkv, page_size, D) int8 key cache.
-        k_qscale:        (Hq, D) float32 per-channel key scale, **already
-                         expanded to query-head count by the caller**.
+        k_qscale:        (Hkv, D) float32 per-channel key scale.
         value_cache:     (N_blocks, Hkv, page_size, D) int8 value cache.
-        v_qscale:        (Hq, D) float32 per-channel value scale, expanded.
+        v_qscale:        (Hkv, D) float32 per-channel value scale.
         cu_seqlens_q:    (B+1,) int32 cumulative query lengths.
         seqlens_kv:      (B,) int32 KV lengths (or None -> use query lengths).
         block_tables:    (B, max_num_blocks) int32 block mapping.
@@ -1492,7 +1511,6 @@ def swa_paged_prefill_with_kv_dequant_impl(
         GQA_INTERLEAVE=gqa_interleave,
         HEAD_DIM=head_dim,
         BLOCK_D=BLOCK_D,
-        BLOCK_N=min(128, triton.next_power_of_2(page_size)),
         PAGE_SIZE=page_size,
         IS_CAUSAL=is_causal,
         LOCAL_WINDOW_SIZE=local_window_size,
