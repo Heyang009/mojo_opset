@@ -1,15 +1,30 @@
 #!/bin/bash
+
+# Source CANN environment
+CANN_PATH="${CANN_PATH:-/usr/local/Ascend/cann}"
+if [ -f "${CANN_PATH}/bin/setenv.bash" ]; then
+    source "${CANN_PATH}/bin/setenv.bash"
+fi
+if [ -f "${CANN_PATH}/opp/vendors/customize/bin/set_env.bash" ]; then
+    source "${CANN_PATH}/opp/vendors/customize/bin/set_env.bash"
+fi
+if [ -f "${CANN_PATH}/opp/vendors/custom_transformer/bin/set_env.bash" ]; then
+    source "${CANN_PATH}/opp/vendors/custom_transformer/bin/set_env.bash"
+fi
+
+# Ensure /usr/local/lib64 is searched first for GLIBCXX compatibility
+export LD_LIBRARY_PATH="/usr/local/lib64:${LD_LIBRARY_PATH:-}"
+
 set -euo pipefail
-rm -rf /tmp/torchinductor_root
-rm -rf /tmp/torch_compile_debug
+env
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 DEFAULT_LOCAL_PATH="/data00/dpskv4-flash-quant"
 export MOJO_BACKEND="ascendc"
 export MOJO_GRAPH_MODE="${MOJO_GRAPH_MODE:-npugraph_ex}"
-export MOJO_PROF="${MOJO_PROF:-1}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
+export MOJO_PROF="${MOJO_PROF:-0}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 
 export PROMPT="${PROMPT:-[\"请用一句话介绍量子计算的核心原理。\"]}"
 # export PROMPT="${PROMPT:-[\"请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。请用一句话介绍量子计算的核心原理。\"]}"
@@ -107,6 +122,8 @@ export MOJO_ATTN_MLA_MULTI_STREAM="${MOJO_ATTN_MLA_MULTI_STREAM:-1}"
 export MOJO_ATTN_COMPRESSOR_MULTI_STREAM="${MOJO_ATTN_COMPRESSOR_MULTI_STREAM:-1}"
 
 EP_SIZE="${EP_SIZE:-8}"
+# npugraph_ex static kernel needs LOCAL_WORLD_SIZE in multi-card launches.
+export LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE:-${EP_SIZE}}"
 NUM_LAYERS="${LLM_NUM_LAYERS:-43}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 PA_MAX_LENGTH="${PA_MAX_LENGTH:-2048}"
@@ -114,6 +131,7 @@ NEXT_N="${NEXT_N:-0}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 export USE_ATTN_METADATA=1
 USE_ATTN_METADATA="${MOJO_USE_ATTN_METADATA:-1}"
+NEXT_N="${NEXT_N:-0}"
 if [ "${MOJO_BUILD_LEGACY_ATTN_INPUTS:-}" = "" ]; then
     if [ "${USE_ATTN_METADATA}" = "1" ]; then
         export MOJO_BUILD_LEGACY_ATTN_INPUTS="0"
@@ -137,7 +155,8 @@ if [ "$EP_SIZE" -eq 1 ]; then
         --prompt "${PROMPT}" \
         --ep_size 1 \
         --batch_size "${BATCH_SIZE}" \
-        --use_attn_metadata "${USE_ATTN_METADATA}"
+        --use_attn_metadata "${USE_ATTN_METADATA}" \
+        --next_n "${NEXT_N}"
 else
     echo "EP=${EP_SIZE}, multi-card inference, batch_size=${BATCH_SIZE}, next_n=${NEXT_N}, use_attn_metadata=${USE_ATTN_METADATA}, build_legacy_attn_inputs=${MOJO_BUILD_LEGACY_ATTN_INPUTS}, moe_multi_stream=${MOJO_MOE_MULTI_STREAM}, attn_mla_multi_stream=${MOJO_ATTN_MLA_MULTI_STREAM}, attn_compressor_multi_stream=${MOJO_ATTN_COMPRESSOR_MULTI_STREAM}"
 
@@ -175,7 +194,8 @@ else
             --prompt "${PROMPT}" \
             --ep_size "${EP_SIZE}" \
             --batch_size "${BATCH_SIZE}" \
-            --use_attn_metadata "${USE_ATTN_METADATA}" &
+            --use_attn_metadata "${USE_ATTN_METADATA}" \
+            --next_n "${NEXT_N}" &
 
         PIDS+=($!)
     done
