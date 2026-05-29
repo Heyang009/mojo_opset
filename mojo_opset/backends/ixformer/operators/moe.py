@@ -109,10 +109,11 @@ class IxformerMoEGating(MojoMoEGating):
 
     @staticmethod
     def _transform_gate_weight_post_hook(module, incompatible_keys):
-        gw0, gw1, gw2 = decompose_fp32_to_3bf16(module.gate_weight.data.T.contiguous())
-        module.gate_weight_bf16_tn_0.copy_(gw0)
-        module.gate_weight_bf16_tn_1.copy_(gw1)
-        module.gate_weight_bf16_tn_2.copy_(gw2)
+        gate_weight = module.gate_weight.data.T.contiguous()
+        gw0, gw1, gw2 = decompose_fp32_to_3bf16(gate_weight)
+        module.register_buffer("gate_weight_bf16_tn_0", gw0)
+        module.register_buffer("gate_weight_bf16_tn_1", gw1)
+        module.register_buffer("gate_weight_bf16_tn_2", gw2)
 
     def forward(self, hidden_states: torch.Tensor):
         gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(hidden_states, self.gate_weight_bf16_tn_2, self.gate_weight_bf16_tn_1, self.gate_weight_bf16_tn_0)
