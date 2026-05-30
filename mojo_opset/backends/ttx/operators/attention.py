@@ -87,7 +87,7 @@ class TTXPagedPrefillGQA(MojoPagedPrefillGQA):
 class TTXPagedPrefillGQAWithKVDequant(MojoPagedPrefillGQAWithKVDequant):
     """Triton paged prefill attention with int8 KV cache on ILU."""
 
-    supported_platforms_list = ["ilu"]
+    supported_platforms_list = ["npu", "ilu"]
 
     def forward(
         self,
