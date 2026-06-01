@@ -527,7 +527,7 @@ class MojoResidualAddRMSNormQuant(MojoOperator):
                 weight=self.weight,
                 eps=self.variance_epsilon,
             )
-            residual = hidden_state
+            residual = normed.to(input_dtype)
 
         normed_output = normed.to(input_dtype)
         normed_fp = _apply_optional_smooth_scale(normed, smooth_scale)

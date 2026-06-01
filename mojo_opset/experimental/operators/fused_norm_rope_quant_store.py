@@ -1,10 +1,12 @@
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from ...core.operator import MojoOperator
-from ...core.operators.kv_cache import build_paged_kv_chunk_metadata
+from ...core.operators.normalization import MojoGroupRMSNorm
+from ...core.operators.position_embedding import MojoApplyRoPE
+from ...core.operators.quantize import MojoStaticQuant
+from ...core.operators.kv_cache import MojoStorePagedKVCache
 
 __all__ = ["MojoFusedNormRoPEQuantStore"]
 
@@ -18,6 +20,12 @@ class MojoFusedNormRoPEQuantStore(MojoOperator):
 
     When ``update_kv=False``, only Q norm+rope is computed — the K/V quant and
     store paths are skipped entirely (useful for YOCO reuse layers).
+
+    Sub-operations are composed from existing Mojo core operators:
+      - ``MojoGroupRMSNorm``: per-head QK norm
+      - ``MojoApplyRoPE``: rotary position embedding
+      - ``MojoStaticQuant``: static per-channel int8 quantization
+      - ``MojoStorePagedKVCache``: paged KV cache store
     """
 
     def __init__(
@@ -39,82 +47,24 @@ class MojoFusedNormRoPEQuantStore(MojoOperator):
         self.num_heads_full_q = num_heads_full_q
         self.num_heads_full_k = num_heads_full_k
         self.head_dim = head_dim
-        self.norm_eps = norm_eps
         self.use_query_norm = use_query_norm
         self.use_key_norm = use_key_norm
-        self.quant_dtype = quant_dtype
-
-        if quant_dtype == torch.int8:
-            self.q_min = -128
-            self.q_max = 127
-        else:
-            raise ValueError(f"Unsupported quant_dtype: {quant_dtype}")
 
         num_norm_groups = (2 if use_query_norm else 0) + (2 if use_key_norm else 0)
         if num_norm_groups > 0:
-            self.qk_norm_weight = torch.nn.Parameter(
-                torch.ones(num_norm_groups, head_dim, **self.tensor_factory_kwargs)
-            )
+            self.qk_norm = MojoGroupRMSNorm(num_norm_groups, head_dim, eps=norm_eps)
         else:
-            self.register_parameter("qk_norm_weight", None)
+            self.qk_norm = None
 
-        self.full_k_scale = torch.nn.Parameter(
-            torch.ones(num_heads_full_k, head_dim, **self.tensor_factory_kwargs)
-        )
-        self.full_v_scale = torch.nn.Parameter(
-            torch.ones(num_heads_full_k, head_dim, **self.tensor_factory_kwargs)
-        )
-        self.swa_k_scale = torch.nn.Parameter(
-            torch.ones(num_heads_swa_k, head_dim, **self.tensor_factory_kwargs)
-        )
-        self.swa_v_scale = torch.nn.Parameter(
-            torch.ones(num_heads_swa_k, head_dim, **self.tensor_factory_kwargs)
-        )
+        self.apply_rope = MojoApplyRoPE()
 
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
+        self.full_k_quantize = MojoStaticQuant((num_heads_full_k, head_dim), quant_dtype=quant_dtype)
+        self.full_v_quantize = MojoStaticQuant((num_heads_full_k, head_dim), quant_dtype=quant_dtype)
+        self.swa_k_quantize = MojoStaticQuant((num_heads_swa_k, head_dim), quant_dtype=quant_dtype)
+        self.swa_v_quantize = MojoStaticQuant((num_heads_swa_k, head_dim), quant_dtype=quant_dtype)
 
-    def _apply_rope_single(self, t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        rope_dim = cos.shape[-1]
-        nope_dim = t.shape[-1] - rope_dim
-        if nope_dim > 0:
-            t_nope, t_rope = torch.split(t, [nope_dim, rope_dim], dim=-1)
-            t_rot = (t_rope * cos + self._rotate_half(t_rope) * sin).to(t.dtype)
-            return torch.cat([t_nope, t_rot], dim=-1)
-        return (t * cos + self._rotate_half(t) * sin).to(t.dtype)
-
-    def _static_quant(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(
-            torch.round(x.float() / scale.float()), self.q_min, self.q_max
-        ).to(self.quant_dtype)
-
-    def _store_kv(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        cu_q_lens: Optional[torch.Tensor],
-        context_kv_lens: torch.Tensor,
-    ) -> None:
-        chunk_metadata = build_paged_kv_chunk_metadata(
-            block_table, cu_q_lens, context_kv_lens, key_cache.shape[2]
-        )
-        if chunk_metadata.shape[0] == 0:
-            return
-        for src_token_start, dst_block_id, dst_block_offset, chunk_len in chunk_metadata.tolist():
-            src_end = src_token_start + chunk_len
-            dst_end = dst_block_offset + chunk_len
-            key_cache[dst_block_id, :, dst_block_offset:dst_end, :] = (
-                key_states[src_token_start:src_end].permute(1, 0, 2)
-            )
-            value_cache[dst_block_id, :, dst_block_offset:dst_end, :] = (
-                value_states[src_token_start:src_end].permute(1, 0, 2)
-            )
+        self.store_full_kvcache = MojoStorePagedKVCache()
+        self.store_swa_kvcache = MojoStorePagedKVCache()
 
     def forward(
         self,
@@ -180,55 +130,42 @@ class MojoFusedNormRoPEQuantStore(MojoOperator):
               - swa_value_out: [T, swa_nkv, head_dim] int8 (None if update_kv=False)
               - swa_v_scale: [swa_nkv, head_dim] (None if update_kv=False)
         """
-        hd = self.head_dim
-
         # --- 1. GroupRMSNorm on Q and/or K ---
-        norm_idx = 0
-        if self.use_query_norm:
-            swa_query = F.rms_norm(swa_query, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-            norm_idx += 1
-            if self.use_key_norm:
-                swa_key = F.rms_norm(swa_key, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-                norm_idx += 1
-            full_query = F.rms_norm(full_query, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-            norm_idx += 1
-            if self.use_key_norm:
-                full_key = F.rms_norm(full_key, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-                norm_idx += 1
+        if self.use_query_norm and self.use_key_norm:
+            swa_query, swa_key, full_query, full_key = self.qk_norm(
+                [swa_query, swa_key, full_query, full_key]
+            )
+        elif self.use_query_norm:
+            swa_query, full_query = self.qk_norm([swa_query, full_query])
         elif self.use_key_norm:
-            swa_key = F.rms_norm(swa_key, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-            norm_idx += 1
-            full_key = F.rms_norm(full_key, (hd,), self.qk_norm_weight[norm_idx], self.norm_eps)
-            norm_idx += 1
+            swa_key, full_key = self.qk_norm([swa_key, full_key])
 
-        # --- 2. RoPE on Q and K (head_first=False → unsqueeze dim=-2) ---
-        cos_exp = cos.unsqueeze(-2)
-        sin_exp = sin.unsqueeze(-2)
-        swa_query = self._apply_rope_single(swa_query, cos_exp, sin_exp)
-        full_query = self._apply_rope_single(full_query, cos_exp, sin_exp)
-
-        if not update_kv:
+        # --- 2. RoPE on Q (always) and K (only if update_kv) ---
+        if update_kv:
+            swa_query, swa_key = self.apply_rope(swa_query, swa_key, cos, sin, head_first=False)
+            full_query, full_key = self.apply_rope(full_query, full_key, cos, sin, head_first=False)
+        else:
+            # Only Q needs rope; pass Q as both q and k, discard second output
+            swa_query, _ = self.apply_rope(swa_query, swa_query, cos, sin, head_first=False)
+            full_query, _ = self.apply_rope(full_query, full_query, cos, sin, head_first=False)
             return (
                 swa_query, full_query,
                 None, None, None, None, None, None, None, None,
             )
 
-        swa_key = self._apply_rope_single(swa_key, cos_exp, sin_exp)
-        full_key = self._apply_rope_single(full_key, cos_exp, sin_exp)
-
         # --- 3. StaticQuant on K and V ---
-        full_key_q = self._static_quant(full_key, self.full_k_scale)
-        full_val_q = self._static_quant(full_value, self.full_v_scale)
-        swa_key_q = self._static_quant(swa_key, self.swa_k_scale)
-        swa_val_q = self._static_quant(swa_value, self.swa_v_scale)
+        full_key_q, full_k_scale = self.full_k_quantize(full_key)
+        full_val_q, full_v_scale = self.full_v_quantize(full_value)
+        swa_key_q, swa_k_scale = self.swa_k_quantize(swa_key)
+        swa_val_q, swa_v_scale = self.swa_v_quantize(swa_value)
 
         # --- 4. Store to paged KV cache ---
-        self._store_kv(
+        self.store_full_kvcache(
             full_key_q, full_val_q,
             full_key_cache, full_value_cache,
             block_tables, cu_q_lens, context_kv_lens,
         )
-        self._store_kv(
+        self.store_swa_kvcache(
             swa_key_q, swa_val_q,
             swa_key_cache, swa_value_cache,
             block_tables_sparse, cu_q_lens_sparse, context_kv_lens_sparse,
@@ -236,10 +173,10 @@ class MojoFusedNormRoPEQuantStore(MojoOperator):
 
         return (
             swa_query, full_query,
-            full_key_q, self.full_k_scale,
-            swa_key_q, self.swa_k_scale,
-            full_val_q, self.full_v_scale,
-            swa_val_q, self.swa_v_scale,
+            full_key_q, full_k_scale,
+            swa_key_q, swa_k_scale,
+            full_val_q, full_v_scale,
+            swa_val_q, swa_v_scale,
         )
 
     def extra_repr(self) -> str:
@@ -249,8 +186,6 @@ class MojoFusedNormRoPEQuantStore(MojoOperator):
             f"num_heads_full_q={self.num_heads_full_q}, "
             f"num_heads_full_k={self.num_heads_full_k}, "
             f"head_dim={self.head_dim}, "
-            f"norm_eps={self.norm_eps}, "
             f"use_query_norm={self.use_query_norm}, "
-            f"use_key_norm={self.use_key_norm}, "
-            f"quant_dtype={self.quant_dtype}"
+            f"use_key_norm={self.use_key_norm}"
         )
