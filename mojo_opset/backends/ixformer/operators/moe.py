@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Optional, Tuple, Union
 
@@ -136,6 +137,8 @@ class IxformerMoEDispatch(MojoMoEDispatch):
         torch.cuda.synchronize()
         self.gdr_buffer_ptr = ixf_f.new_gdr_buffer(self.gdr_device_buffer)
 
+        self.disable_sync = os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1"
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -146,6 +149,8 @@ class IxformerMoEDispatch(MojoMoEDispatch):
     ):
         if enable_cuda_graph:
             assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        
+        need_gpu_size = self.disable_sync or enable_cuda_graph
 
         if hidden_states.dim() == 3:
             num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
@@ -159,13 +164,13 @@ class IxformerMoEDispatch(MojoMoEDispatch):
         (src_to_dst, 
          sorted_token_ids,
          expert_sizes_gpu, 
-         expert_sizes_cpu) = ixf_f.moe_compute_token_index(top_k_indices, self.num_experts, gdr_buffer_ptr=self.gdr_buffer_ptr if not enable_cuda_graph else None)
+         expert_sizes_cpu) = ixf_f.moe_compute_token_index(top_k_indices, self.num_experts, gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr)
         
-        if not enable_cuda_graph:
-            tokens_per_expert = expert_sizes_cpu
-        else:
+        if need_gpu_size:
             tokens_per_expert = expert_sizes_gpu
-        
+        else:
+            tokens_per_expert = expert_sizes_cpu
+
         expand_tokens = num_tokens * top_k
 
         if weight_dtype in [torch.int8, "int4"]:
@@ -176,8 +181,7 @@ class IxformerMoEDispatch(MojoMoEDispatch):
                                                 topk=top_k,
                                                 src_to_dst=src_to_dst,
                                                 topk_ids=top_k_indices,
-                                                smooth_scales=smooth_scale,
-                                                output_format=1 if enable_cuda_graph and weight_dtype == "int4" else 0)
+                                                smooth_scales=smooth_scale)
             return (
                 i8_hidden_states.view(-1, dim),
                 sorted_token_ids,
@@ -200,6 +204,7 @@ class IxformerMoEDispatch(MojoMoEDispatch):
                 src_to_dst,
                 tokens_per_expert,
             )
+
     def __del__(self):
         ixf_f.delete_gdr_buffer(self.gdr_buffer_ptr)
 
@@ -349,6 +354,7 @@ class IxformerQuantExperts(MojoQuantExperts):
         self.register_load_state_dict_post_hook(_swizzle_weights_post_hook)
         
         self.output_dtype = torch.bfloat16
+        self.disable_sync = os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1"
 
         if self.up_weight_dtype == "int4" and self.down_weight_dtype == "int4": 
             self.gdr_device_buffer1 = torch.zeros([8 * 1024 * 1024], dtype=torch.int8, device="cuda")
@@ -390,31 +396,25 @@ class IxformerQuantExperts(MojoQuantExperts):
                     format=0
                 )
         elif self.up_weight_dtype == "int4":
-            if not enable_cuda_graph:
-                group_gemm_output1 = ixf_f.moe_w4a8_group_gemm(
-                    input=sorted_hidden_states,
-                    weight=self.up_proj_weight,
-                    i_scales=input_scale,
-                    w_scales=self.up_proj_weight_scale,
-                    output_dtype=self.output_dtype,
-                    tokens_per_experts=tokens_per_expert,
-                    format=0,
-                    version=1,
-                    group_size=self.up_quant_group_size,
-                    gdr_buffer_ptr=self.gdr_buffer_ptr1,
-                )
-            else:
-                group_gemm_output1 = ixf_f.moe_w4a8_group_gemv(
-                    input=sorted_hidden_states,
-                    weight=self.up_proj_weight,
-                    i_scales=input_scale,
-                    w_scales=self.up_proj_weight_scale,
-                    output_dtype=self.output_dtype,
-                    tokens_per_experts=tokens_per_expert,
-                    format=0,
-                    version=1,
-                    group_size=self.up_quant_group_size,
-                )
+            group_gemm_output1 = torch.empty(
+                (sorted_hidden_states.shape[0], self.up_proj_weight_scale.shape[-1]),
+                dtype=self.output_dtype,
+                device=sorted_hidden_states.device,
+            )
+            ixf_f.moe_w4a8_group_gemm(
+                input=sorted_hidden_states,
+                weight=self.up_proj_weight,
+                i_scales=input_scale,
+                w_scales=self.up_proj_weight_scale,
+                output_dtype=self.output_dtype,
+                tokens_per_experts=tokens_per_expert,
+                format=0,
+                version=1,
+                group_size=self.up_quant_group_size,
+                gdr_buffer_ptr=self.gdr_buffer_ptr1 if not (self.disable_sync or enable_cuda_graph) else None,
+                output=group_gemm_output1,
+                enable_cuda_graph=(self.disable_sync or enable_cuda_graph),
+            )
         else:
             raise NotImplementedError(f"IxformerQuantExperts: up_weight_dtype must be 'torch.int8' or 'int4', got {self.up_weight_dtype}.")
 
@@ -423,9 +423,8 @@ class IxformerQuantExperts(MojoQuantExperts):
             smooth_scales=self.down_proj_quantize.inv_smooth_scale,
             dst_to_src=sorted_token_ids,
             topk_ids=topk_indices,
-            act_type="swiglu",
-            output_format=1 if enable_cuda_graph and self.down_weight_dtype == "int4" else 0
-        )
+            act_type="swiglu")
+
         num_tokens, top_k = topk_indices.shape
 
         group_gemm_output2 = torch.empty(num_tokens * top_k, self.hidden_size, dtype=self.output_dtype, device=sorted_token_ids.device)
@@ -456,35 +455,21 @@ class IxformerQuantExperts(MojoQuantExperts):
                     output=group_gemm_output2,
                 )
         elif self.down_weight_dtype == "int4":
-            if not enable_cuda_graph:
-                ixf_f.moe_w4a8_group_gemm(
-                    input=act_i8,
-                    weight=self.down_proj_weight,
-                    i_scales=act_scale,
-                    w_scales=self.down_proj_weight_scale,
-                    output_dtype=self.output_dtype,
-                    tokens_per_experts=tokens_per_expert,
-                    dst_to_src=sorted_token_ids,
-                    format=0,
-                    version=1,
-                    group_size=self.down_quant_group_size,
-                    output=group_gemm_output2,
-                    gdr_buffer_ptr=self.gdr_buffer_ptr2,
-                )
-            else:
-                ixf_f.moe_w4a8_group_gemv(
-                    input=act_i8,
-                    weight=self.down_proj_weight,
-                    i_scales=act_scale,
-                    w_scales=self.down_proj_weight_scale,
-                    output_dtype=self.output_dtype,
-                    tokens_per_experts=tokens_per_expert,
-                    dst_to_src=sorted_token_ids,
-                    format=0,
-                    version=1,
-                    group_size=self.down_quant_group_size,
-                    output=group_gemm_output2,
-                )
+            ixf_f.moe_w4a8_group_gemm(
+                input=act_i8,
+                weight=self.down_proj_weight,
+                i_scales=act_scale,
+                w_scales=self.down_proj_weight_scale,
+                output_dtype=self.output_dtype,
+                tokens_per_experts=tokens_per_expert,
+                dst_to_src=sorted_token_ids,
+                format=0,
+                version=1,
+                group_size=self.down_quant_group_size,
+                output=group_gemm_output2,
+                gdr_buffer_ptr=self.gdr_buffer_ptr2 if not (self.disable_sync or enable_cuda_graph) else None,
+                enable_cuda_graph=(self.disable_sync or enable_cuda_graph),
+            )
         else:
             raise NotImplementedError(f"IxformerQuantExperts: down_weight_dtype must be 'torch.int8' or 'int4', got {self.down_weight_dtype}.")
         
@@ -524,6 +509,9 @@ class IxformerMoE(MojoMoE):
         else:
             enable_cuda_graph = False
 
+        if os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1":
+            raise NotImplementedError(f"IxformerMoE: disable_sync is True, is not supported in MojoMoE ixformer backend.")
+
         top_k_indices, top_k_gates = self.gating(hidden_states)
 
         sorted_hidden_states, sorted_token_ids, src_to_dst, tokens_per_expert = self.dispatch(
@@ -532,9 +520,6 @@ class IxformerMoE(MojoMoE):
             weight_dtype=torch.bfloat16,
             enable_cuda_graph=enable_cuda_graph
         )
-
-        if not enable_cuda_graph:
-            tokens_per_expert = tokens_per_expert.cpu()
 
         expert_outputs = self.experts(sorted_hidden_states, tokens_per_expert, sorted_token_ids, top_k_indices, enable_cuda_graph)
         
@@ -573,6 +558,9 @@ class IxformerQuantMoE(MojoQuantMoE):
             down_weight_dtype,
             **kwargs,
         )
+        
+        if os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1" and (self.up_weight_dtype != "int4" or self.down_weight_dtype != "int4"):
+            raise NotImplementedError(f"IxformerQuantMoE: up_weight_dtype or down_weight_dtype is not 'int4', is not supported when disable_sync is True.")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
