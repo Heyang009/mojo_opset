@@ -355,6 +355,12 @@ class PagedDummyCache:
         self.cache_data = {}
         self._state_block_table_offsets = {}
         self._state_block_pos_ids = {}
+
+        def calc_state_cache_size(ratio: int) -> int:
+            overlap = 1 if ratio == 4 else 0
+            num_ratio_group = (1 if self.next_n == 0 else 2) + overlap
+            return num_ratio_group * ratio
+
         for layer_idx in range(self.num_layers):
             ratio = config.compress_ratios[layer_idx] if layer_idx < len(config.compress_ratios) else 0
             cache_dict = {
@@ -372,8 +378,7 @@ class PagedDummyCache:
 
             if ratio == 4:
                 cmp_block_num = self._get_block_num(self.pa_max_length // ratio)
-                overlap_num = 2
-                state_block_num = self._get_block_num((1 + overlap_num) * ratio)
+                state_block_num = self._get_block_num(calc_state_cache_size(ratio))
                 cache_dict["sfa_cmp_kv"] = self._create_cache(cmp_block_num, self.head_dim, torch.bfloat16)
                 cache_dict["sfa_kv_state"] = self._create_state_cache(state_block_num, ratio, self.head_dim)
                 cache_dict["li_cmp_kv"] = self._create_cache(cmp_block_num, self.index_head_dim, torch.int8)
@@ -386,8 +391,7 @@ class PagedDummyCache:
                 )
             elif ratio == 128:
                 cmp_block_num = self._get_block_num(self.pa_max_length // ratio)
-                overlap_num = 1
-                state_block_num = self._get_block_num(overlap_num * ratio)
+                state_block_num = self._get_block_num(calc_state_cache_size(ratio))
                 cache_dict["sfa_cmp_kv"] = self._create_cache(cmp_block_num, self.head_dim, torch.bfloat16)
                 cache_dict["sfa_kv_state"] = self._create_state_cache(state_block_num, ratio, self.head_dim)
                 cmp_block_num_per_batch = (cmp_block_num - 1) // self.batch_size
@@ -401,8 +405,7 @@ class PagedDummyCache:
         for ratio in sorted(set(r if r > 1 else 0 for r in config.compress_ratios)):
             if ratio <= 1:
                 continue
-            overlap = 1 if ratio == 4 else 0
-            state_cache_size = (1 + overlap) * ratio
+            state_cache_size = calc_state_cache_size(ratio)
             self._state_block_table_offsets[ratio], self._state_block_pos_ids[ratio] = (
                 self._calc_state_block_table_templates(state_cache_size, self.batch_size)
             )
@@ -483,7 +486,8 @@ class PagedDummyCache:
     ) -> torch.Tensor:
         ratio = self.config.compress_ratios[layer_idx]
         overlap = 1 if ratio == 4 else 0
-        state_cache_size = (1 + overlap) * ratio
+        num_ratio_group = (1 if self.next_n == 0 else 2) + overlap
+        state_cache_size = num_ratio_group * ratio
         return self._calc_state_block_table(state_cache_size, start_pos, seq_used_q, is_prefill)
 
     def get_cmp_state_block_table_decode(self, layer_idx: int, start_pos: torch.Tensor) -> torch.Tensor:
