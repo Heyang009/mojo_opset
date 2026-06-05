@@ -183,6 +183,7 @@ def _rot_pos_embed_kernel(
     configs=[
         triton.Config({"TOKEN_BLOCK_SIZE": 1}),
         triton.Config({"TOKEN_BLOCK_SIZE": 2}),
+        triton.Config({"TOKEN_BLOCK_SIZE": 3}),
         triton.Config({"TOKEN_BLOCK_SIZE": 4}),
         triton.Config({"TOKEN_BLOCK_SIZE": 8}),
         triton.Config({"TOKEN_BLOCK_SIZE": 16}),
@@ -502,6 +503,7 @@ def rope_fwd_impl(
         # token_block_size,
         ALIGNED=is_aligned,
         INVERSE=False,
+        multibuffer=True,
     )
 
     if head_first:
