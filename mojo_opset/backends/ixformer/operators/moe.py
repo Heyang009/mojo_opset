@@ -158,8 +158,8 @@ class IxformerMoE(MojoMoE):
         else:
             enable_cuda_graph = False
 
-        if os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1":
-            raise NotImplementedError(f"IxformerMoE: disable_sync is True, is not supported in MojoMoE ixformer backend.")
+        if enable_cuda_graph and not self.disable_sync:
+            raise RuntimeError("IxformerMoE: CUDA graph capture requires disable_sync=True (set IXFORMER_DISABLE_SYNC=1).")
 
         # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
         gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
@@ -169,9 +169,6 @@ class IxformerMoE(MojoMoE):
             self.gating.gate_weight_bf16_tn_0,
         )
         top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
-
-        # CUDA-graph capture and disable_sync both forbid the CPU readback of expert sizes.
-        need_gpu_size = self.disable_sync or enable_cuda_graph
 
         if hidden_states.dim() == 3:
             num_tokens_in = hidden_states.shape[0] * hidden_states.shape[1]
@@ -195,7 +192,7 @@ class IxformerMoE(MojoMoE):
                 self.num_experts,
                 self.ep_start,
                 self.ep_end,
-                gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
+                gdr_buffer_ptr=None if self.disable_sync else self.gdr_buffer_ptr,
             )
         else:
             (src_to_dst,
@@ -204,11 +201,11 @@ class IxformerMoE(MojoMoE):
              expert_sizes_cpu) = ixf_f.moe_compute_token_index(
                 top_k_indices,
                 self.num_experts,
-                gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
+                gdr_buffer_ptr=None if self.disable_sync else self.gdr_buffer_ptr,
             )
             expand_tokens = num_tokens * top_k
 
-        tokens_per_expert = expert_sizes_gpu if need_gpu_size else expert_sizes_cpu
+        tokens_per_expert = expert_sizes_gpu if self.disable_sync else expert_sizes_cpu
 
         sorted_hidden_states = ixf_f.moe_expand_input(
             hidden_states=dispatch_input,
@@ -226,7 +223,7 @@ class IxformerMoE(MojoMoE):
             )
         else:
             # gemv variant takes GPU-side sizes so kernel shapes don't depend on CPU values during graph capture.
-            if not enable_cuda_graph:
+            if not self.disable_sync:
                 group_gemm_output1 = ixf_f.moe_w16a16_group_gemm(
                     input=sorted_hidden_states,
                     weight=self.experts.up_proj_weight,
@@ -252,7 +249,7 @@ class IxformerMoE(MojoMoE):
                 dtype=sorted_hidden_states.dtype, device=sorted_hidden_states.device,
             )
 
-            if not enable_cuda_graph:
+            if not self.disable_sync:
                 ixf_f.moe_w16a16_group_gemm(
                     input=act,
                     weight=self.experts.down_proj_weight,
@@ -410,6 +407,9 @@ class IxformerQuantMoE(MojoQuantMoE):
         else:
             enable_cuda_graph = False
 
+        if enable_cuda_graph and not self.disable_sync:
+            raise RuntimeError("IxformerQuantMoE: CUDA graph capture requires disable_sync=True (set IXFORMER_DISABLE_SYNC=1).")
+
         if hidden_states.dtype == torch.float16:
             raise NotImplementedError(f"IxformerQuantMoE: hidden_states dtype must be 'torch.bfloat16', got {hidden_states.dtype}.")
 
@@ -421,9 +421,6 @@ class IxformerQuantMoE(MojoQuantMoE):
             self.gating.gate_weight_bf16_tn_0,
         )
         top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
-
-        # CUDA-graph capture and disable_sync both forbid the CPU readback of expert sizes.
-        need_gpu_size = self.disable_sync or enable_cuda_graph
 
         if hidden_states.dim() == 3:
             num_tokens_in = hidden_states.shape[0] * hidden_states.shape[1]
@@ -447,7 +444,7 @@ class IxformerQuantMoE(MojoQuantMoE):
                 self.num_experts,
                 self.ep_start,
                 self.ep_end,
-                gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
+                gdr_buffer_ptr=None if self.disable_sync else self.gdr_buffer_ptr,
             )
         else:
             (src_to_dst,
@@ -456,12 +453,10 @@ class IxformerQuantMoE(MojoQuantMoE):
              expert_sizes_cpu) = ixf_f.moe_compute_token_index(
                 top_k_indices,
                 self.num_experts,
-                gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
+                gdr_buffer_ptr=None if self.disable_sync else self.gdr_buffer_ptr,
             )
             expand_tokens = num_tokens * top_k
-        tokens_per_expert = expert_sizes_gpu if need_gpu_size else expert_sizes_cpu
-
-        graph_mode = self.disable_sync or enable_cuda_graph
+        tokens_per_expert = expert_sizes_gpu if self.disable_sync else expert_sizes_cpu
 
         # Fuses expert-sort, expansion, smooth-quant scaling, and dynamic-int8 quantization into one kernel.
         # output_format=1 emits the layout the w4a8 gemv path expects under graph capture.
@@ -473,7 +468,7 @@ class IxformerQuantMoE(MojoQuantMoE):
             src_to_dst=src_to_dst,
             topk_ids=top_k_indices,
             smooth_scales=self.experts.up_proj_quantize.inv_smooth_scale,
-            output_format=1 if graph_mode and self.up_weight_dtype == "int4" else 0,
+            output_format=1 if self.disable_sync and self.up_weight_dtype == "int4" else 0,
         )
         i8_hs = i8_hs.view(-1, dim)
 
@@ -486,7 +481,7 @@ class IxformerQuantMoE(MojoQuantMoE):
         else:
             # gemv variant takes GPU-side sizes so kernel shapes don't depend on CPU values during graph capture.
             if self.up_weight_dtype == torch.int8:
-                if not graph_mode:
+                if not self.disable_sync:
                     group_gemm_output1 = ixf_f.moe_w8a8_group_gemm(
                         input=i8_hs,
                         weight=self.experts.up_proj_weight,
@@ -507,7 +502,7 @@ class IxformerQuantMoE(MojoQuantMoE):
                         format=0,
                     )
             elif self.up_weight_dtype == "int4":
-                if not graph_mode:
+                if not self.disable_sync:
                     group_gemm_output1 = ixf_f.moe_w4a8_group_gemm(
                         input=i8_hs,
                         weight=self.experts.up_proj_weight,
@@ -542,7 +537,7 @@ class IxformerQuantMoE(MojoQuantMoE):
                 dst_to_src=sorted_token_ids,
                 topk_ids=top_k_indices,
                 act_type="swiglu",
-                output_format=1 if graph_mode and self.down_weight_dtype == "int4" else 0,
+                output_format=1 if self.disable_sync and self.down_weight_dtype == "int4" else 0,
             )
 
             group_gemm_output2 = torch.empty(
@@ -551,7 +546,7 @@ class IxformerQuantMoE(MojoQuantMoE):
             )
 
             if self.down_weight_dtype == torch.int8:
-                if not graph_mode:
+                if not self.disable_sync:
                     ixf_f.moe_w8a8_group_gemm(
                         input=act_i8,
                         weight=self.experts.down_proj_weight,
@@ -576,7 +571,7 @@ class IxformerQuantMoE(MojoQuantMoE):
                         output=group_gemm_output2,
                     )
             elif self.down_weight_dtype == "int4":
-                if not graph_mode:
+                if not self.disable_sync:
                     ixf_f.moe_w4a8_group_gemm(
                         input=act_i8,
                         weight=self.experts.down_proj_weight,
