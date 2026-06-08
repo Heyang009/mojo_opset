@@ -716,9 +716,11 @@ def _swa_paged_decode_kernel(
     seqlens_ptr,
     block_tables_ptr,
     BATCH_SIZE,
+    seq_lens,
     NUM_TOTAL_BLOCKS,
     MAX_NUM_BLOCKS_PER_SEQ,
     stride_qb,
+    stride_qs,
     stride_qh,
     stride_qd,
     stride_k_block,
@@ -730,6 +732,7 @@ def _swa_paged_decode_kernel(
     stride_v_blksz,
     stride_v_dim,
     stride_ob,
+    stride_os,
     stride_oh,
     stride_od,
     stride_bt_batch,
@@ -758,10 +761,15 @@ def _swa_paged_decode_kernel(
     pid = tl.program_id(0)
     n_progs = tl.num_programs(0)
 
-    num_tasks = BATCH_SIZE * NUM_KV_HEADS * NUM_Q_HEAD_BLOCKS_PER_KV_HEAD
+    num_tasks = BATCH_SIZE * seq_lens * NUM_KV_HEADS * NUM_Q_HEAD_BLOCKS_PER_KV_HEAD
+    # num_tasks = BATCH_SIZE * NUM_KV_HEADS * NUM_Q_HEAD_BLOCKS_PER_KV_HEAD
 
     for q_task_id in range(pid, num_tasks, n_progs):
-        b_id = q_task_id // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD // NUM_KV_HEADS
+        # b_id = q_task_id // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD // NUM_KV_HEADS
+        # kv_head_id = q_task_id // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD % NUM_KV_HEADS
+        # q_head_block_id = q_task_id % NUM_Q_HEAD_BLOCKS_PER_KV_HEAD
+        b_id = q_task_id // seq_lens // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD // NUM_KV_HEADS
+        seq_id = q_task_id // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD // NUM_KV_HEADS % seq_lens
         kv_head_id = q_task_id // NUM_Q_HEAD_BLOCKS_PER_KV_HEAD % NUM_KV_HEADS
         q_head_block_id = q_task_id % NUM_Q_HEAD_BLOCKS_PER_KV_HEAD
 
@@ -770,7 +778,8 @@ def _swa_paged_decode_kernel(
         offs_d = tl.arange(0, BLOCK_SIZE_D)
         offs_gqa_block = q_head_block_id * BLOCK_SIZE_Q_HEADS + tl.arange(0, BLOCK_SIZE_Q_HEADS)
         offs_head_block = kv_head_id * GQA_GROUP_STRIDE + offs_gqa_block * GQA_HEAD_STRIDE
-        q_ptrs = q_ptr + b_id * stride_qb + offs_head_block[:, None] * stride_qh + offs_d[None, :] * stride_qd
+        # q_ptrs = q_ptr + b_id * stride_qb + offs_head_block[:, None] * stride_qh + offs_d[None, :] * stride_qd
+        q_ptrs = q_ptr + b_id * stride_qb + seq_id * stride_qs + offs_head_block[:, None] * stride_qh + offs_d[None, :] * stride_qd
 
         q = tl.load(q_ptrs, mask = (offs_d[None, :] < HEAD_DIM) & (offs_gqa_block[:, None] < GQA_GROUP_SIZE), other = 0.0)
 
@@ -787,7 +796,6 @@ def _swa_paged_decode_kernel(
             GLOBAL_WINDOW,
             LOCAL_WINDOW,
         )
-        
 
         for kv_block_id in range(num_global_window_blocks):
             kv_block_start = kv_block_id * BLOCK_SIZE_N
@@ -890,7 +898,7 @@ def _swa_paged_decode_kernel(
             # avoid division by zero
             acc = acc / l_i[:, None]
 
-        o_ptrs = o_ptr + b_id * stride_ob + offs_head_block[:, None] * stride_oh + offs_d[None, :] * stride_od
+        o_ptrs = o_ptr + b_id * stride_ob + seq_id * stride_os + offs_head_block[:, None] * stride_oh + offs_d[None, :] * stride_od
         tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=(offs_d[None, :] < HEAD_DIM) & (offs_gqa_block[:, None] < GQA_GROUP_SIZE))
 
 
@@ -905,7 +913,15 @@ def swa_paged_decode_impl(
     gqa_interleave: bool = False,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    batch_size, num_q_heads, head_dim = q.shape
+    if q.ndim == 4:
+        batch_size, seq_lens, num_q_heads, head_dim = q.shape
+        stride_qb, stride_qs, stride_qh, stride_qd = q.stride()
+    else:
+        batch_size, num_q_heads, head_dim = q.shape
+        stride_qb, stride_qh, stride_qd = q.stride()
+        seq_lens = 1
+        stride_qs = 1
+
     num_total_blocks, num_kv_heads, page_size, head_dim_cache = key_cache.shape
 
     max_num_blocks_per_seq = block_tables.shape[1]
@@ -931,11 +947,13 @@ def swa_paged_decode_impl(
         seqlens,
         block_tables,
         batch_size,
+        seq_lens,
         num_total_blocks,
         max_num_blocks_per_seq,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
         key_cache.stride(0),
         key_cache.stride(1),
         key_cache.stride(2),
@@ -944,9 +962,10 @@ def swa_paged_decode_impl(
         value_cache.stride(1),
         value_cache.stride(2),
         value_cache.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
+        stride_qb,
+        stride_qs,
+        stride_qh,
+        stride_qd,
         block_tables.stride(0),
         block_tables.stride(1),
         softmax_scale,
@@ -963,5 +982,4 @@ def swa_paged_decode_impl(
         num_warps=1, num_stages=3,
         pipeline_strategies=["reduce_delay"],
     )
-
     return o
