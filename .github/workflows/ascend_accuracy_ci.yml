@@ -108,7 +108,14 @@ jobs:
           echo "Running compute+comm distributed tests..."
           unset ASCEND_VISIBLE_DEVICES
           unset ASCEND_RT_VISIBLE_DEVICES
-          python3 -m pytest -v mojo_opset/tests/accuracy/operators/test_compute_with_comm.py; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 5 ]
+          # pytest exits 5 when no tests are collected. Disable `-e` around
+          # pytest so we can capture the real exit code into rc; under `-e`
+          # the shell would otherwise exit at the first failing command.
+          set +e
+          python3 -m pytest -v mojo_opset/tests/accuracy/operators/test_compute_with_comm.py
+          rc=$?
+          set -e
+          [ $rc -eq 0 ] || [ $rc -eq 5 ]
       - name: test-TTX-graph
         shell: bash
         run: |

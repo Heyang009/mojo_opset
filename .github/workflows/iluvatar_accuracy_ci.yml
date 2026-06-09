@@ -100,11 +100,10 @@ jobs:
             set -euo pipefail
             cd /workspace
             echo 'Running distributed MoE EP=2 tests (ttx + ixformer) on Iluvatar GPU...'
-            for backend in ttx ixformer; do
-              echo \"--- backend=\$backend ---\"
-              MOJO_BACKEND=\$backend torchrun --nproc-per-node=2 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 \
-                -m pytest -v mojo_opset/tests/distributed/test_moe_ep.py
-            done
+            MOJO_BACKEND=ttx torchrun --nproc-per-node=2 --master_port=31876 \
+              -m pytest -v mojo_opset/tests/distributed/test_moe_ep.py
+            MOJO_BACKEND=ixformer torchrun --nproc-per-node=2 --master_port=31877 \
+              -m pytest -v mojo_opset/tests/distributed/test_moe_ep.py
           "
 
       - name: Cleanup
