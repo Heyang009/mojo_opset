@@ -1141,6 +1141,12 @@ class IxformerPagedDecodeGQAWithKVDequant(MojoPagedDecodeGQAWithKVDequant):
             - Only causal attention is supported.
         """
         assert_paged_decode_contract(block_tables, total_seq_lens)
+        real_batches = total_seq_lens > 0
+
+        output_buf = torch.empty_like(query)
+        query = query[real_batches]
+        total_seq_lens = total_seq_lens[real_batches]
+        block_tables = block_tables[real_batches]
 
         if bool((total_seq_lens <= 0).any().item()):
             raise NotImplementedError(
@@ -1212,6 +1218,8 @@ class IxformerPagedDecodeGQAWithKVDequant(MojoPagedDecodeGQAWithKVDequant):
             max_context_len=max_total_seq_len,
             causal=self.is_causal,
         )
+        output_buf[real_batches] = output
+        output = output_buf
         return output
 
 
@@ -1354,6 +1362,12 @@ class IxformerPagedDecodeSWAWithKVDequant(MojoPagedDecodeSWAWithKVDequant):
             - Only causal attention is supported.
         """
         assert_paged_decode_contract(block_table, total_seq_lens)
+        real_batches = total_seq_lens > 0
+
+        output_buf = torch.empty_like(query)
+        query = query[real_batches]
+        total_seq_lens = total_seq_lens[real_batches]
+        block_table = block_table[real_batches]
 
         if bool((total_seq_lens <= 0).any().item()):
             raise NotImplementedError(
@@ -1447,4 +1461,6 @@ class IxformerPagedDecodeSWAWithKVDequant(MojoPagedDecodeSWAWithKVDequant):
             max_context_len=max_window_context,
             causal=self.is_causal,
         )
+        output_buf[real_batches] = output
+        output = output_buf
         return output
