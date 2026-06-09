@@ -727,12 +727,9 @@ class MojoPagedDecodeSWA(MojoOperator):
                     self.global_window_size,
                 ).to(s_i.device)
                 s_i = torch.where(s_mask, s_i, float("-inf"))
-            # m_i = torch.max(s_i, dim=-1, keepdim=True).values  # -> [n_q_heads, 1, 1]
-            # s_i = s_i - m_i  # -> [n_q_heads, 1, kv_seq_len]
             m_i = torch.max(s_i, dim=-1, keepdim=True).values  # -> [n_q_heads, seq_len, 1]
             s_i = s_i - m_i  # -> [n_q_heads, seq_len, kv_seq_len]
             p_i = torch.exp(s_i)
-            # l_i = torch.sum(p_i, dim=-1, keepdim=True)  # -> [n_q_heads, 1, 1]
             l_i = torch.sum(p_i, dim=-1, keepdim=True)  # -> [n_q_heads, seq_len, 1]
             p_i = p_i.to(query.dtype)
 
@@ -747,8 +744,6 @@ class MojoPagedDecodeSWA(MojoOperator):
                     v_i = v_i.repeat_interleave(n_q_heads // n_kv_heads, dim=0)  # -> [n_q_heads, kv_seq_len, head_dim]
             o_i = torch.bmm(p_i, v_i).float()  # -> [n_q_heads, seq_len, head_dim]
             o_i = o_i / l_i  # -> [n_q_heads, seq_len, head_dim]
-            # o_i = o_i.squeeze(1)  # -> [n_q_heads, head_dim]
-            # o[i] = o_i.to(o.dtype)
             if query.ndim == 4:
                 o_i = o_i.permute(1, 0, 2)  # -> [seq_len, n_q_heads, head_dim]
                 o[i] = o_i.to(o.dtype)
