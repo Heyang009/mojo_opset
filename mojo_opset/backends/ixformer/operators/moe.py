@@ -425,15 +425,18 @@ class IxformerQuantMoE(MojoQuantMoE):
         if hidden_states.dtype == torch.float16:
             raise NotImplementedError(f"IxformerQuantMoE: hidden_states dtype must be 'torch.bfloat16', got {hidden_states.dtype}.")
 
-        # DP input: gather peer ranks' shards so gating/dispatch see the full token set.
+        # DP input: gather peer ranks' shards so dispatch sees the full token set.
+        # Issued async via torch.distributed and awaited just before the first consumer;
+        # top_k_indices/top_k_gates are gathered the same way after gating runs locally.
         if self.dp_input and self.ep_size > 1:
             local_tokens = hidden_states.shape[0]
             full = torch.empty(
                 local_tokens * self.ep_size, hidden_states.shape[1],
                 dtype=hidden_states.dtype, device=hidden_states.device,
             )
-            ixfd.all_gather_into_tensor(full, hidden_states.contiguous(), group=self.ep_group, async_op=True)
-            hidden_states = full
+            full_hdl = dist.all_gather_into_tensor(full, hidden_states.contiguous(), group=self.ep_group, async_op=True)
+        else:
+            full_hdl = None
 
         # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
         gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
@@ -444,7 +447,25 @@ class IxformerQuantMoE(MojoQuantMoE):
         )
         top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
 
+        if self.dp_input and self.ep_size > 1:
+            full_indices = torch.empty((local_tokens * self.ep_size, *top_k_indices.shape[1:]), device=top_k_indices.device, dtype=top_k_indices.dtype)
+            indices_hdl = dist.all_gather_into_tensor(full_indices, top_k_indices.contiguous(), group=self.ep_group, async_op=True)
+
+            full_gates = torch.empty((local_tokens * self.ep_size, *top_k_gates.shape[1:]), device=top_k_gates.device, dtype=top_k_gates.dtype)
+            gates_hdl = dist.all_gather_into_tensor(full_gates, top_k_gates.contiguous(), group=self.ep_group, async_op=True)
+        else:
+            indices_hdl = None
+            gates_hdl = None
+
+        if full_hdl is not None:
+            full_hdl.wait()
+            hidden_states = full
+
         num_tokens, dim = hidden_states.shape
+
+        if indices_hdl is not None:
+            indices_hdl.wait()
+            top_k_indices = full_indices
 
         need_gpu_size = self.disable_sync or enable_cuda_graph
 
@@ -477,6 +498,9 @@ class IxformerQuantMoE(MojoQuantMoE):
             expand_tokens = num_tokens * self.top_k
         
         if sorted_token_ids.shape[0] == 0:
+            if gates_hdl is not None:
+                # avoid handle leakage
+                gates_hdl.wait()
             combined = torch.zeros(
                 num_tokens, self.hidden_size,
                 dtype=hidden_states.dtype, device=hidden_states.device,
@@ -605,6 +629,11 @@ class IxformerQuantMoE(MojoQuantMoE):
 
             # src_to_dst == -1 marks padding slots that must not be summed.
             reduce_mask = src_to_dst == -1
+
+            if gates_hdl is not None:
+                gates_hdl.wait()
+                top_k_gates = full_gates
+
             combined = ixf_f.moe_output_reduce_sum(
                 input=expert_outputs,
                 topk_weight=top_k_gates,
