@@ -37,5 +37,8 @@ from .tensor_parallel import MojoQKVColwiseParallel
 from .tensor_parallel import MojoRowwiseParallel
 from .tensor_parallel import MojoSwiGLUParallel
 from .tensor_parallel import MojoTensorParallel
+from .tensor_parallel import deepseek_v4_lmhead_tp_forward
+from .tensor_parallel import get_deepseek_v4_lmhead_tp_partition
+from .tensor_parallel import split_even_range
 from .utils import mojo_parallel_load_state_dict_naive
 from .utils import mojo_parallel_save_state_dict_naive

@@ -54,12 +54,12 @@ from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_
 from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_prefill
 from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_sfa_compressor
 from mojo_opset.distributed.parallel.context_parallel import gather_cp_prefill_hidden_states
-from mojo_opset.distributed.parallel.data_parallel import gather_lmhead_logits_for_attn_dp
-from mojo_opset.distributed.parallel.data_parallel import prepare_lmhead_input_for_attn_dp
 from mojo_opset.distributed.parallel.expert_parallel import build_deepseek_v4_moe_mc2_kwargs
 from mojo_opset.distributed.parallel.expert_parallel import deepseek_v4_moe_infer_ep_decode
 from mojo_opset.distributed.parallel.expert_parallel import deepseek_v4_moe_infer_ep_prefill
 from mojo_opset.distributed.parallel.expert_parallel import gather_deepseek_v4_moe_smooth_scale_1
+from mojo_opset.distributed.parallel.tensor_parallel import deepseek_v4_lmhead_tp_forward
+from mojo_opset.distributed.parallel.tensor_parallel import get_deepseek_v4_lmhead_tp_partition
 
 
 _INPLACE_PARTIAL_ROTARY_MUL = MojoInplacePartialRotaryMul()
@@ -70,14 +70,6 @@ _MOE_SHARED_EXPERT_STREAMS = {}
 _ATTN_MLA_STREAMS = {}
 _ATTN_COMPRESSOR_STREAMS = {}
 _NPU_FRACTAL_NZ_FORMAT = 29
-
-
-def _split_even_range(total_size: int, world_size: int, rank: int) -> Tuple[int, int]:
-    shard = (total_size + world_size - 1) // world_size
-    start = rank * shard
-    end = min(start + shard, total_size)
-    return start, end
-
 
 def _create_contiguous_subgroup(
     subgroup_size: int,
@@ -2847,42 +2839,15 @@ class DeepseekV4ForMTP(nn.Module):
                 if gather_q_lens is not None:
                     gather_index = (gather_q_lens - 1).unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
                     hidden_states = torch.gather(hidden_states, 1, gather_index)
-            local_bs, q_len, hidden_size = hidden_states.shape
-            hidden_states_for_lm = hidden_states.view(local_bs * q_len, 1, hidden_size).to(torch.bfloat16)
-            lmhead_tp_group = self.hccl_comm_dict.get("lmhead_tp_group")
-            if self.attn_dp_size > 1 and self.lmhead_tp_size > 1 and lmhead_tp_group is not None and dist.is_initialized():
-                gathered_hidden = hidden_states_for_lm.new_empty(
-                    self.lmhead_tp_size * hidden_states_for_lm.shape[0],
-                    hidden_states_for_lm.shape[1],
-                    hidden_states_for_lm.shape[2],
-                )
-                dist.all_gather_into_tensor(
-                    gathered_hidden,
-                    hidden_states_for_lm.contiguous(),
-                    group=lmhead_tp_group,
-                )
-                hidden_states_for_lm = gathered_hidden
-
-            logits_flat = self.lm_head(hidden_states_for_lm.view(-1, hidden_size))
-            logits = logits_flat.view(*hidden_states_for_lm.shape[:-1], self.local_vocab_size)
-            if self.lmhead_tp_size > 1 and lmhead_tp_group is not None and dist.is_initialized():
-                if self.attn_dp_size == 1:
-                    gathered_logits = logits.new_empty(
-                        self.lmhead_tp_size * logits.shape[0],
-                        logits.shape[1],
-                        logits.shape[2],
-                    )
-                    dist.all_gather_into_tensor(gathered_logits, logits.contiguous(), group=lmhead_tp_group)
-                else:
-                    gathered_logits = logits.new_empty(logits.numel()).view(-1)
-                    dist.all_to_all_single(gathered_logits, logits.contiguous().view(-1), group=lmhead_tp_group)
-                    gathered_logits = gathered_logits.view_as(logits)
-
-                gathered_logits = gathered_logits.reshape(
-                    self.lmhead_tp_size, local_bs * q_len, logits.shape[1], -1
-                ).permute(1, 2, 0, 3)
-                logits = gathered_logits.reshape(local_bs * q_len, logits.shape[1], -1)[..., : self.config.vocab_size]
-            logits = logits.reshape(local_bs, q_len, -1)
+            logits = deepseek_v4_lmhead_tp_forward(
+                lm_head=self.lm_head,
+                hidden_states=hidden_states,
+                local_vocab_size=self.local_vocab_size,
+                vocab_size=self.config.vocab_size,
+                attn_dp_size=self.attn_dp_size,
+                lmhead_tp_size=self.lmhead_tp_size,
+                lmhead_tp_group=self.hccl_comm_dict.get("lmhead_tp_group"),
+            )
             if return_hidden:
                 return logits, past_key_values, mtp_hidden
             return logits, past_key_values
@@ -2946,6 +2911,9 @@ class DeepseekV4ForMTP(nn.Module):
         DeepseekV4ForCausalLM._init_default_weights(model)
         if main_model is not None:
             model.lm_head = main_model.lm_head
+            model.local_vocab_size = main_model.local_vocab_size
+            model.lmhead_tp_size = main_model.lmhead_tp_size
+            model.attn_dp_size = main_model.attn_dp_size
             model.model.rotary_emb = main_model.model.rotary_emb
             model.model.compress_rotary_emb = main_model.model.compress_rotary_emb
 
@@ -3034,12 +3002,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.lmhead_tp_size = int(self.parallel_config.get("lmhead_tp_size", 1))
         self.use_parallelize_module_tp = bool(int(self.parallel_config.get("use_parallelize_module_tp", 0)))
         self.o_proj_tp_size = int(self.parallel_config.get("o_proj_tp_size", self.attn_tp_size))
-        lmhead_init_tp_size = 1 if self.use_parallelize_module_tp and self.lmhead_tp_size > 1 else self.lmhead_tp_size
-        self.lmhead_tp_rank = global_rank % lmhead_init_tp_size if lmhead_init_tp_size > 1 else 0
-        self.lmhead_vocab_start, self.lmhead_vocab_end = _split_even_range(
-            config.vocab_size, lmhead_init_tp_size, self.lmhead_tp_rank
+        self.lmhead_tp_rank, self.lmhead_vocab_start, self.lmhead_vocab_end, self.local_vocab_size = (
+            get_deepseek_v4_lmhead_tp_partition(
+                config.vocab_size,
+                global_rank=global_rank,
+                lmhead_tp_size=self.lmhead_tp_size,
+                use_parallelize_module_tp=self.use_parallelize_module_tp,
+            )
         )
-        self.local_vocab_size = self.lmhead_vocab_end - self.lmhead_vocab_start
         self.model = DeepseekV4Model(config, ep_size=ep_size, ep_rank=ep_rank, parallel_config=self.parallel_config)
         self.lm_head = MojoGemm(
             in_features=config.hidden_size,
@@ -3088,27 +3058,15 @@ class DeepseekV4ForCausalLM(nn.Module):
             if gather_q_lens is not None:
                 gather_index = (gather_q_lens - 1).unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
                 hidden_states = torch.gather(hidden_states, 1, gather_index)
-        local_bs, q_len, hidden_size = hidden_states.shape
-        hidden_states_for_lm = hidden_states.view(local_bs * q_len, 1, hidden_size).to(torch.bfloat16)
-        hidden_states_for_lm = prepare_lmhead_input_for_attn_dp(
-            hidden_states_for_lm,
-            attn_dp_size=self.attn_dp_size,
-            lmhead_tp_size=self.lmhead_tp_size,
-            lmhead_tp_group=self.hccl_comm_dict.get("lmhead_tp_group"),
-        )
-
-        logits_flat = self.lm_head(hidden_states_for_lm.view(-1, hidden_size))
-        logits = logits_flat.view(*hidden_states_for_lm.shape[:-1], self.local_vocab_size)
-        logits = gather_lmhead_logits_for_attn_dp(
-            logits,
-            local_batch=local_bs,
-            q_len=q_len,
+        logits = deepseek_v4_lmhead_tp_forward(
+            lm_head=self.lm_head,
+            hidden_states=hidden_states,
+            local_vocab_size=self.local_vocab_size,
             vocab_size=self.config.vocab_size,
             attn_dp_size=self.attn_dp_size,
             lmhead_tp_size=self.lmhead_tp_size,
             lmhead_tp_group=self.hccl_comm_dict.get("lmhead_tp_group"),
-        )
-        logits = logits.reshape(local_bs, q_len, -1).float()
+        ).float()
         return logits, past_key_values, mtp_hidden
 
     def init_parallel_comm_group(self):
