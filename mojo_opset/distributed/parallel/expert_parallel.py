@@ -18,6 +18,10 @@ from mojo_opset.distributed.parallel.utils import shard_tensor
 from mojo_opset.distributed.parallel.utils import stat_dict_rename_hook
 
 
+# DeepSeek V4 MoE-EP runtime helpers.
+#
+# The model keeps local expert computation methods and operator instances; this
+# module owns the EP routing, communication, and MC2 dispatch/combine orchestration.
 def build_deepseek_v4_moe_mc2_kwargs(moe):
     global_rank = dist.get_rank()
     moe_ep_group_name = moe.hccl_comm_dict.get("moe_ep_group_mc2_name", None)
@@ -54,6 +58,16 @@ def build_deepseek_v4_moe_mc2_kwargs(moe):
     return dispatch_kwargs, combine_kwargs
 
 
+def _build_deepseek_v4_moe_token_splits(tokens_per_expert_group, tokens_per_expert, ep_size: int):
+    """Build all-to-all split lists for DeepSeek V4 prefill MoE-EP routing."""
+
+    combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+    combine_tokens = combine_tokens.view(2, ep_size, -1).sum(2)
+    all_tokens = combine_tokens[0].sum()
+    output_splits, input_splits = combine_tokens.cpu().tolist()
+    return all_tokens, input_splits, output_splits
+
+
 def deepseek_v4_moe_infer_ep_prefill(
     moe,
     hidden_states_flat,
@@ -63,6 +77,8 @@ def deepseek_v4_moe_infer_ep_prefill(
     shared_expert_out=None,
     shared_expert_event=None,
 ):
+    """Run DeepSeek V4 prefill MoE-EP with double all-to-all routing."""
+
     moe_ep_group = moe.ep_group
     n_tokens = hidden_states_flat.shape[0]
 
@@ -81,12 +97,11 @@ def deepseek_v4_moe_infer_ep_prefill(
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
     dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
 
-    combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
-    combine_tokens = combine_tokens.view(2, moe.ep_size, -1).sum(2)
-    all_tokens = combine_tokens[0].sum()
-    combine_tokens_cpu = combine_tokens.cpu().tolist()
-    input_splits = combine_tokens_cpu[1]
-    output_splits = combine_tokens_cpu[0]
+    all_tokens, input_splits, output_splits = _build_deepseek_v4_moe_token_splits(
+        tokens_per_expert_group,
+        tokens_per_expert,
+        moe.ep_size,
+    )
 
     gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
     dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
@@ -136,6 +151,8 @@ def deepseek_v4_moe_infer_ep_decode(
     shared_expert_out=None,
     shared_expert_event=None,
 ):
+    """Run DeepSeek V4 decode MoE-EP with MC2 distribute dispatch/combine."""
+
     if moe.dispatch_kwargs is None:
         moe.set_mc2_kwargs()
 
@@ -239,6 +256,7 @@ class _EPCombineWrapper(nn.Module):
 
 
 def _ep_partition_fn(src_data_rank, name, module, device_mesh):
+    del name
     from mojo_opset.core.operators.moe import MojoExperts
     from mojo_opset.core.operators.moe import MojoMoE
     from mojo_opset.core.operators.moe import MojoQuantExperts

@@ -46,20 +46,26 @@ from mojo_opset import MojoCompressor
 from mojo_opset import MojoScatterNdUpdateAsc
 from mojo_opset import MojoSparseAttnSharedkv
 from mojo_opset import MojoSparseAttnSharedkvMetadata
+from mojo_opset.distributed.parallel.context_parallel import (
+    apply_cp_zigzag_to_prefill_inputs,
+    deepseek_v4_cp_get_window,
+    deepseek_v4_cp_run_indexer,
+    deepseek_v4_cp_run_prefill,
+    deepseek_v4_cp_run_sfa_compressor,
+    gather_cp_prefill_hidden_states,
+)
+from mojo_opset.distributed.parallel.expert_parallel import (
+    build_deepseek_v4_moe_mc2_kwargs,
+    deepseek_v4_moe_infer_ep_decode,
+    deepseek_v4_moe_infer_ep_prefill,
+    gather_deepseek_v4_moe_smooth_scale_1,
+)
 from mojo_opset.distributed.parallel.mesh import LLMParallelConfig
 from mojo_opset.distributed.parallel.mesh import init_llm_parallel_groups
-from mojo_opset.distributed.parallel.context_parallel import apply_cp_zigzag_to_prefill_inputs
-from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_get_window
-from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_indexer
-from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_prefill
-from mojo_opset.distributed.parallel.context_parallel import deepseek_v4_cp_run_sfa_compressor
-from mojo_opset.distributed.parallel.context_parallel import gather_cp_prefill_hidden_states
-from mojo_opset.distributed.parallel.expert_parallel import build_deepseek_v4_moe_mc2_kwargs
-from mojo_opset.distributed.parallel.expert_parallel import deepseek_v4_moe_infer_ep_decode
-from mojo_opset.distributed.parallel.expert_parallel import deepseek_v4_moe_infer_ep_prefill
-from mojo_opset.distributed.parallel.expert_parallel import gather_deepseek_v4_moe_smooth_scale_1
-from mojo_opset.distributed.parallel.tensor_parallel import deepseek_v4_lmhead_tp_forward
-from mojo_opset.distributed.parallel.tensor_parallel import get_deepseek_v4_lmhead_tp_partition
+from mojo_opset.distributed.parallel.tensor_parallel import (
+    deepseek_v4_lmhead_tp_forward,
+    get_deepseek_v4_lmhead_tp_partition,
+)
 
 
 _INPLACE_PARTIAL_ROTARY_MUL = MojoInplacePartialRotaryMul()

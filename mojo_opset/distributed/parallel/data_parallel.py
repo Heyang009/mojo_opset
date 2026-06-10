@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict
 from typing import List
 
@@ -13,17 +14,38 @@ from mojo_opset.distributed.parallel.mojo_parallel import MojoDistributedModule
 from mojo_opset.distributed.parallel.mojo_parallel import MojoRegisterableParallelStyle
 
 
+@dataclass
+class DeepseekV4AttnDPInputs:
+    """Batch tensors and ownership metadata after DeepSeek V4 Attention-DP sharding."""
+
+    full_input_ids: torch.Tensor
+    full_attention_mask: torch.Tensor
+    full_lengths: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    lengths: torch.Tensor
+    prompts: list
+    rendered: list
+    shard_start: int
+    shard_end: int
+    attn_dp_size: int
+    dp_rank: int
+
+
 class MojoDataParallel(MojoRegisterableParallelStyle):
     def __init__(
         self,
         *,
-        desired_args_input_layouts: List[Placement] = [],  # Layouts used only for non-DTensor inputs
-        desired_kwargs_input_layouts: Dict[str, Placement] = {},  # Layouts used only for non-DTensor inputs
-        desired_output_layouts: List[Placement] = [],  # This layout is the placement used to convert the local tensor
+        desired_args_input_layouts: List[Placement] | None = None,  # Layouts used only for non-DTensor inputs
+        desired_kwargs_input_layouts: Dict[str, Placement] | None = None,  # Layouts used only for non-DTensor inputs
+        desired_output_layouts: List[Placement] | None = None,  # This layout is the placement used to convert the local tensor
         # output by the operator into the corresponding DTensor according to the distributed semantics required by the operator
         use_local_output: bool = True,
     ):
         super().__init__()
+        desired_args_input_layouts = desired_args_input_layouts or []
+        desired_kwargs_input_layouts = desired_kwargs_input_layouts or {}
+        desired_output_layouts = desired_output_layouts or []
         assert desired_args_input_layouts or desired_kwargs_input_layouts or desired_output_layouts
         self.desired_args_input_layouts = desired_args_input_layouts
         self.desired_kwargs_input_layouts = desired_kwargs_input_layouts
@@ -302,17 +324,17 @@ def prepare_deepseek_v4_attn_dp_inputs(
         attn_tp_size=attn_tp_size,
         cp_size=cp_size,
     )
-    return {
-        "full_input_ids": full_input_ids,
-        "full_attention_mask": full_attention_mask,
-        "full_lengths": full_lengths,
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "lengths": lengths,
-        "prompts": local_prompts,
-        "rendered": local_rendered,
-        "shard_start": shard_start,
-        "shard_end": shard_end,
-        "attn_dp_size": attn_dp_size,
-        "dp_rank": dp_rank,
-    }
+    return DeepseekV4AttnDPInputs(
+        full_input_ids=full_input_ids,
+        full_attention_mask=full_attention_mask,
+        full_lengths=full_lengths,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        lengths=lengths,
+        prompts=local_prompts,
+        rendered=local_rendered,
+        shard_start=shard_start,
+        shard_end=shard_end,
+        attn_dp_size=attn_dp_size,
+        dp_rank=dp_rank,
+    )

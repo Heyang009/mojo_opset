@@ -16,6 +16,10 @@ from mojo_opset.distributed.parallel.data_parallel import gather_lmhead_logits_f
 from mojo_opset.distributed.parallel.data_parallel import prepare_lmhead_input_for_attn_dp
 
 
+# DeepSeek V4 LMHead-TP helpers.
+#
+# These helpers keep model files free from LMHead-TP communication details while
+# the generic MojoTensorParallel styles below remain reusable for regular modules.
 def split_even_range(total_size: int, num_partitions: int, partition_rank: int) -> tuple[int, int]:
     base = total_size // num_partitions
     rem = total_size % num_partitions

@@ -10,6 +10,7 @@ from .context_parallel import forward_cp_prefill_minibatch_mojo
 from .context_parallel import gather_cp_prefill_hidden_states
 from .context_parallel import get_zigzag_idx
 from .context_parallel import pad_deepseek_v4_cp_prefill
+from .data_parallel import DeepseekV4AttnDPInputs
 from .data_parallel import MojoDataParallel
 from .data_parallel import gather_decode_shard_tensor
 from .data_parallel import gather_lmhead_logits_for_attn_dp
