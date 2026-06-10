@@ -425,27 +425,65 @@ class IxformerQuantMoE(MojoQuantMoE):
         if hidden_states.dtype == torch.float16:
             raise NotImplementedError(f"IxformerQuantMoE: hidden_states dtype must be 'torch.bfloat16', got {hidden_states.dtype}.")
 
-        # DP input: gather peer ranks' shards so dispatch sees the full token set.
-        # Issued async via torch.distributed and awaited just before the first consumer;
-        # top_k_indices/top_k_gates are gathered the same way after gating runs locally.
+        # DP input: gather peer ranks' shards so gating/dispatch see the full token set.
+        # AG(h) is launched on torch.distributed's NCCL comm stream so it overlaps with
+        # local gating; gating is per-token, so we run it on the LOCAL shard first and
+        # all_gather the (tiny) routing tensors afterwards. dispatch then sees the
+        # full hidden_states + full routing.
         if self.dp_input and self.ep_size > 1:
             local_tokens = hidden_states.shape[0]
             full = torch.empty(
                 local_tokens * self.ep_size, hidden_states.shape[1],
                 dtype=hidden_states.dtype, device=hidden_states.device,
             )
-            full_hdl = dist.all_gather_into_tensor(full, hidden_states.contiguous(), group=self.ep_group, async_op=True)
-        else:
-            full_hdl = None
+            h_hdl = dist.all_gather_into_tensor(
+                full, hidden_states.contiguous(), group=self.ep_group, async_op=True,
+            )
 
-        # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
-        gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
-            hidden_states,
-            self.gating.gate_weight_bf16_tn_2,
-            self.gating.gate_weight_bf16_tn_1,
-            self.gating.gate_weight_bf16_tn_0,
-        )
-        top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
+            # gating on local hidden_states — runs on compute stream while AG(h) flies.
+            local_gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
+                hidden_states,
+                self.gating.gate_weight_bf16_tn_2,
+                self.gating.gate_weight_bf16_tn_1,
+                self.gating.gate_weight_bf16_tn_0,
+            )
+            local_top_k_gates, local_top_k_indices = ixf_f.moe_topk_softmax(
+                local_gate_logits, self.gating.top_k, renormalize=True,
+            )
+
+            full_top_k_indices = torch.empty(
+                local_tokens * self.ep_size, *local_top_k_indices.shape[1:],
+                dtype=local_top_k_indices.dtype, device=local_top_k_indices.device,
+            )
+            idx_hdl = dist.all_gather_into_tensor(
+                full_top_k_indices, local_top_k_indices.contiguous(),
+                group=self.ep_group, async_op=True,
+            )
+            full_top_k_gates = torch.empty(
+                local_tokens * self.ep_size, *local_top_k_gates.shape[1:],
+                dtype=local_top_k_gates.dtype, device=local_top_k_gates.device,
+            )
+            gates_hdl = dist.all_gather_into_tensor(
+                full_top_k_gates, local_top_k_gates.contiguous(),
+                group=self.ep_group, async_op=True,
+            )
+
+            h_hdl.wait()
+            idx_hdl.wait()
+            gates_hdl.wait()
+
+            hidden_states = full
+            top_k_indices = full_top_k_indices
+            top_k_gates = full_top_k_gates
+        else:
+            # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
+            gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
+                hidden_states,
+                self.gating.gate_weight_bf16_tn_2,
+                self.gating.gate_weight_bf16_tn_1,
+                self.gating.gate_weight_bf16_tn_0,
+            )
+            top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
 
         if self.dp_input and self.ep_size > 1:
             full_indices = torch.empty((local_tokens * self.ep_size, *top_k_indices.shape[1:]), device=top_k_indices.device, dtype=top_k_indices.dtype)
