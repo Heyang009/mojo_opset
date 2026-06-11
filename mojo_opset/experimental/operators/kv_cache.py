@@ -343,8 +343,72 @@ class MojoPagedAttentionStoreKvCache(MojoOperator):
         return key_cache, value_cache if has_value else key_cache
 
 
+class MojoPagedCacheDequant(MojoOperator):
+    """Dequantize an int8 paged KV cache."""
+
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def _reshape_scale(scale: torch.Tensor, head_num: int, head_dim: int) -> torch.Tensor:
+        if scale.dim() == 1:
+            if head_num != 1 or scale.size(0) != head_dim:
+                raise ValueError(
+                    f"1D dequant_scale requires head_num=1 and shape [{head_dim}], got head_num={head_num}, shape={tuple(scale.shape)}."
+                )
+            return scale.reshape(1, 1, 1, head_dim)
+        if scale.dim() == 2:
+            if scale.shape != (head_num, head_dim):
+                raise ValueError(f"2D dequant_scale must have shape [{head_num}, {head_dim}], got {tuple(scale.shape)}.")
+            return scale.reshape(1, head_num, 1, head_dim)
+        raise ValueError(f"dequant_scale must be 1D or 2D, got shape {tuple(scale.shape)}.")
+
+    def forward(
+        self,
+        quantized_cache: torch.Tensor,
+        dequant_scale: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            quantized_cache: Int8 paged cache with shape
+                ``[num_blocks, head_num, block_size, head_dim]``.
+            dequant_scale: Dequantization scale with shape ``[head_num, head_dim]``
+                or ``[head_dim]`` when ``head_num == 1``.
+            block_table: Logical-to-physical block table with shape
+                ``[batch_size, max_blocks]``. Entries with ``-1`` are ignored by
+                paged cache implementations.
+
+        Returns:
+            BF16 dequantized cache with the same shape as ``quantized_cache``.
+        """
+        if quantized_cache.dim() != 4:
+            raise ValueError(
+                f"quantized_cache must be 4D [num_blocks, head_num, block_size, head_dim], got {tuple(quantized_cache.shape)}."
+            )
+        if quantized_cache.dtype != torch.int8:
+            raise TypeError(f"quantized_cache must be torch.int8, got {quantized_cache.dtype}.")
+        if block_table.dim() != 2:
+            raise ValueError(f"block_table must be 2D, got {tuple(block_table.shape)}.")
+        if block_table.dtype != torch.int64:
+            raise TypeError(f"block_table must be torch.int64, got {block_table.dtype}.")
+
+        num_blocks, head_num, _, head_dim = quantized_cache.shape
+        scale = self._reshape_scale(dequant_scale, head_num, head_dim)
+        output = torch.empty(quantized_cache.shape, dtype=torch.bfloat16, device=quantized_cache.device)
+        valid_block_ids = block_table[block_table != -1]
+        if valid_block_ids.numel() == 0:
+            return output
+        if int(valid_block_ids.min().item()) < 0 or int(valid_block_ids.max().item()) >= num_blocks:
+            raise ValueError(f"block_table contains block ids outside [-1, {num_blocks}).")
+
+        output[valid_block_ids] = (quantized_cache[valid_block_ids].float() * scale).to(torch.bfloat16)
+        return output
+
+
 __all__ = [
     "MojoGatherRopeStore",
+    "MojoPagedCacheDequant",
     "MojoPagedAttentionStoreKvCache",
     "MojoStorePagedMLAKVCache",
 ]

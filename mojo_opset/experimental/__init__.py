@@ -25,6 +25,7 @@ from .operators.indexer import MojoIndexer
 from .operators.indexer import MojoLightningIndexer
 from .operators.kv_cache import MojoGatherRopeStore
 from .operators.kv_cache import MojoPagedAttentionStoreKvCache
+from .operators.kv_cache import MojoPagedCacheDequant
 from .operators.kv_cache import MojoStorePagedMLAKVCache
 from .operators.moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .operators.moe import MojoMoEInitRoutingDynamicQuant
@@ -57,6 +58,7 @@ __all__ = [
     "MojoPagedPrefillSageGQA",
     "MojoGatherRopeStore",
     "MojoPagedAttentionStoreKvCache",
+    "MojoPagedCacheDequant",
     "MojoStorePagedMLAKVCache",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
