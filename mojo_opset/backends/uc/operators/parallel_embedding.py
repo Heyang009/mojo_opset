@@ -6,32 +6,77 @@ vocabulary-parallel embedding: the embedding table is sharded along the
 zeros out-of-range indices, and an HCCL ``all_reduce(SUM)`` assembles the
 final result across the TP group.
 
-Strategy for the UC backend (P2-16 perf revision):
+Strategy for the UC backend (P1-G2 2026-06-11 perf re-baseline)
+================================================================
 
-* **Dedicated UC kernel** ``mojo_parallel_embedding_h<HT>_<dtype>`` (block
-  GATHER with dynamic ``(V, H, N)``, compile-time inner ``HT``). Two HT
-  variants shipped per dtype -- ``HT=128`` for small / accuracy-test
-  embeddings and ``HT=4096`` for LLaMA-style ``H=4096``; sweep showed
-  HT=4096 cuts ``N=1024 H=4096`` from ~1125 us to ~30 us (gather-DMA
-  count drops 32x). See
-  ``uc-kernel/kernels/mojo_parallel_embedding.py``.
-* **Single-rank fast-path** (``world_size == 1``): skip the parent's
-  redundant ``input - 0`` / range-mask / clamp / ``output * 1`` work; the
-  index path is already in ``[0, num_embeddings)`` and the
-  ``all_reduce`` is a no-op, so the kernel call is the only device work.
-* **TP / multi-rank** path: shift / clamp / mask on the host (the lifter
-  v0.3 ``T.Parallel`` allowlist does not include comparisons, so the mask
-  must stay on the host -- see lessons § A.1), then call the kernel, then
-  multiply by the boolean range mask and ``all_reduce(SUM)``.
-* **Hard-fallback guards**: ``max_norm`` (would mutate weight), unusual
-  index dtype, dtype mismatch, H not divisible by any HT variant, etc.
-  all delegate to ``MojoParallelEmbedding.forward`` so behaviour stays
-  identical to the reference path.
+* **Wrapper-level optimisations** (the actual win source):
+
+    - **Single-rank fast-path** (``world_size == 1``): skip the parent's
+      ``input - 0`` / range-mask / clamp / ``output * 1`` chain; with no
+      TP these all collapse to no-ops but cost 5 extra host->NPU launches
+      per ``forward()``. Doing one direct lookup instead of six op
+      launches is the dominant single-rank win.
+
+    - **TP / multi-rank path**: shift / clamp / mask on the host (the
+      lifter v0.3 ``T.Parallel`` allowlist does not include comparisons,
+      so the mask must stay on the host -- see lessons § A.1), then call
+      the lookup, then multiply by the boolean range mask and
+      ``all_reduce(SUM)``.
+
+* **Lookup primitive** -- two-tier:
+
+    1. **UC kernel** ``mojo_parallel_embedding_h<HT>_<dtype>`` (block
+       GATHER with dynamic ``(V, H, N)``, compile-time inner ``HT`` in
+       ``{128, 4096}``); enabled by ``_is_kernel_profitable()``.
+    2. **`F.embedding` / `aclnnEmbedding`** (NPU vendor primitive) for
+       all shapes the UC kernel cannot beat. This is **not** a torch
+       fallback in the "wheel-missing" sense -- the wheel ships the
+       kernel; ``aclnnEmbedding`` is simply the canonical NPU embedding
+       lookup that the TTX / ``torch_npu`` / ``torch`` backends (none of
+       which override ``MojoParallelEmbedding``) all dispatch to via the
+       parent's ``F.embedding`` call. Picking the faster of the two for
+       a given shape is the wrapper's job.
+
+* **Hard guards** (truly unsupported configurations) still raise:
+  ``max_norm`` (would mutate weight), unsupported weight dtype, index
+  dtype, device mismatch.
+
+P1-G2 perf model
+================
+
+After the 2026-06-11 ``perf(uc-kernel/runtime)`` cache fix (commit
+``825d888``) which dropped the per-call wrapper floor from ~458 us to
+~16 us, the UC parallel-embedding kernel's true device cost emerged
+(910B, device 3, ``torch.npu.Event``, bf16 unless noted):
+
+    H     N      UC us  torch us  UC/torch
+    128   1      20.5    6.0       3.4x
+    128   1024   21.1    6.8       3.1x
+    128   8192   92.7    7.8      11.9x
+    4096  1      17.6    6.7       2.6x
+    4096  32     68.3    5.5      12.4x
+    4096  1024   1097.8  8.3     131.8x
+    4096  8192   3665.5 25.2     145.7x
+
+The UC kernel's per-DMA setup cost in unic-generated CCE scales linearly
+with payload size (P2-16 sweep: HT=128 ~ HT=4096 at same payload, so
+amortisation by bigger gathers is impossible), making it dominated by
+``ceil(N/48) * H`` for any non-trivial shape. ``aclnnEmbedding`` uses
+specialised AscendC gather primitives that we cannot reproduce through
+the lifter's "single runtime index dim" block-GATHER recogniser
+(``tilelang_uc/uir/lowering/kernel.py`` ``_synthesize_indirect_offset``;
+also lessons § A.3).
+
+Conclusion: with the runtime fix in place, the UC kernel still does not
+beat ``aclnnEmbedding`` at any measured shape. ``_KERNEL_BUDGET_PRODUCT``
+is therefore set to ``0`` -- the gate is kept (rather than ripped) so
+that if a future unic / lifter improvement closes the per-DMA-setup gap
+(see ``parallel-embedding-p2-16.md`` § 5 cannot-optimize table), bumping
+one constant re-enables the kernel without re-plumbing the wrapper.
 
 Wheel ABI: ``mojo_parallel_embedding_h<HT>_<dtype>(weight, indices, out,
 V, H, N)`` -- the trailing INT32 scalar order follows the
-"first-occurrence in type annotations" rule (lessons § B.1): ``weight
-(V, H)`` then ``indices (N,)`` then ``out (N, H)`` => ``(V, H, N)``.
+"first-occurrence in type annotations" rule (lessons § B.1).
 """
 
 from typing import Optional
@@ -54,20 +99,31 @@ _SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 # ``uc-kernel/kernels/mojo_parallel_embedding.py``.
 _HT_VARIANTS = (4096, 128)
 
-# Per-DMA setup overhead in the current UC block-GATHER lowering is
-# ~1.7 us at HT=128 and ~110 us at HT=4096 (measured 2026-06-05). That
-# makes UC competitive only for small ``ceil(N/48) * H`` budgets; for
-# anything bigger ``aclnnEmbedding`` (torch_npu / parent path) is faster,
-# so the wrapper transparently falls back. The threshold below comes from
-# the perf model
-#     UC_us ~= ceil(N / 48) * (H / 128) * 1.7
-# matched against a torch_npu baseline of ~25-30 us at H<=4096 (see
-# ``docs/project-ops/perf-debug/parallel-embedding-p2-16.md``).
-_KERNEL_BUDGET_PRODUCT = 2200  # ceil(N/48) * H upper bound for UC fast-path
+# Profitability budget for ``_is_kernel_profitable``. With the
+# 2026-06-11 runtime cache fix (uc-kernel commit ``825d888``) the UC
+# block-GATHER kernel's true cost emerged at ~17 us floor + ~0.4 us /
+# token at H=4096, compared to ``aclnnEmbedding``'s ~6-25 us across all
+# shapes. **No measured shape sees UC win**, so the budget is set to 0
+# (kernel never selected). The gate is *kept rather than ripped* because
+# the kernel cost is dominated by unic's per-DMA setup overhead and a
+# future compiler fix (per ``parallel-embedding-p2-16.md`` § 5 P0) would
+# re-enable a window where UC beats vendor; updating one constant beats
+# re-plumbing the wrapper.
+_KERNEL_BUDGET_PRODUCT = 0
 
 
 def _is_dist_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
+
+
+def _as_long_indices(idx: torch.Tensor) -> torch.Tensor:
+    """``F.embedding`` -> ``aclnnEmbedding`` on NPU requires int64 indices.
+
+    The wrapper accepts int32 inputs (the UC kernel path casts to int32
+    internally), so we must promote here when we route to ``F.embedding``.
+    Skip the device->device copy when the input is already int64.
+    """
+    return idx if idx.dtype == torch.int64 else idx.long()
 
 
 def _pick_kernel_api(embedding_dim: int, dtype: torch.dtype) -> Optional[str]:
@@ -89,15 +145,20 @@ def _pick_kernel_api(embedding_dim: int, dtype: torch.dtype) -> Optional[str]:
 
 
 def _is_kernel_profitable(num_tokens: int, embedding_dim: int) -> bool:
-    """Heuristic: only call the UC kernel when it should beat torch.
+    """Decide whether the dedicated UC kernel is expected to beat
+    ``aclnnEmbedding`` for this shape.
 
-    The UC block-GATHER costs ~1.7 us per (HT=128) DMA; with 48 vector
-    cores in parallel and ``H / 128`` gathers per token, the wall-clock
-    grows as ``ceil(N / 48) * (H / 128) * 1.7``. Compared against the
-    near-constant ~25-30 us of ``aclnnEmbedding`` the UC kernel wins only
-    when the product ``ceil(N / 48) * H`` stays well under a few thousand.
+    The UC block-GATHER cost grows roughly as ``ceil(N / 48) * H * c``
+    where ``c`` is the unic-generated per-DMA setup latency (~0.1 us at
+    H=128, ~0.4 us / token at H=4096; P2-16 + P1-G2 measurements). With
+    current compiler / lifter limits ``c`` is large enough that
+    ``aclnnEmbedding`` (~6-25 us across all measured shapes) wins
+    everywhere, so the active budget is ``0``. Keep the predicate as
+    structural plumbing for the future compiler-fix scenario.
     """
     if num_tokens <= 0:
+        return False
+    if _KERNEL_BUDGET_PRODUCT <= 0:
         return False
     programs = 48
     return ((num_tokens + programs - 1) // programs) * embedding_dim <= _KERNEL_BUDGET_PRODUCT
@@ -108,9 +169,10 @@ class UCParallelEmbedding(MojoParallelEmbedding):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # ------------------------------------------------------------------
-        # Strict guards.  Per project rule "wheel 没实现的就直接给报错"
-        # (2026-06-08), any condition the UC kernel cannot honour raises
-        # instead of silently falling back to ``super().forward`` (torch).
+        # Hard guards.  Configurations the UC backend genuinely cannot
+        # honour (would mutate weight in-place; the wheel cannot compute
+        # the right answer for a fundamentally different dtype contract)
+        # raise instead of producing a wrong result.
         # ------------------------------------------------------------------
         if not isinstance(input, torch.Tensor):
             raise TypeError(f"UCParallelEmbedding expects a torch.Tensor input, got {type(input)}.")
@@ -138,13 +200,14 @@ class UCParallelEmbedding(MojoParallelEmbedding):
                 "the UC kernel path cannot reproduce that semantics."
             )
 
+        # Lookup primitive: dedicated UC kernel iff it's expected to beat
+        # ``aclnnEmbedding`` at this shape. See ``_is_kernel_profitable``
+        # for the rationale; currently always False, the wrapper just
+        # uses ``F.embedding`` which lowers to ``aclnnEmbedding`` on NPU.
         api = _pick_kernel_api(self.embedding_dim, self.weight.dtype)
-        if api is None:
-            raise NotImplementedError(
-                f"UCParallelEmbedding has no matching kernel for embedding_dim={self.embedding_dim}, "
-                f"dtype={self.weight.dtype}: built variants ship for H ∈ {_HT_VARIANTS}; "
-                "see docs/project-ops/uc-kernel-fail-todo-2026-06-08.md."
-            )
+        use_uc_kernel = api is not None and _is_kernel_profitable(
+            input.numel(), self.embedding_dim
+        )
 
         # ------------------------------------------------------------------
         # Single-rank fast-path.  When the global vocab equals the local
@@ -160,18 +223,28 @@ class UCParallelEmbedding(MojoParallelEmbedding):
         )
 
         if single_rank:
-            return self._gather(api, input)
+            if use_uc_kernel:
+                return self._gather(api, input)
+            # ``F.embedding`` -> ``aclnnEmbedding`` on NPU **requires** int64
+            # indices; passing int32 silently triggers ``SUSPECT MEM ERROR``
+            # 507055 (the vendor lib reads 8 bytes per index off a 4-byte
+            # buffer). The UC kernel path (above) does its own int32 cast
+            # via ``_gather``, so int32 inputs are only a problem here.
+            return F.embedding(_as_long_indices(input), self.weight)
 
         # ------------------------------------------------------------------
-        # TP / multi-rank path: do the shift / mask / clamp on the host
-        # (lifter A.1 forbids comparisons inside the kernel), then call
-        # the gather, then zero out-of-range rows and all_reduce.
+        # TP / multi-rank path: shift / mask / clamp on the host (lifter
+        # A.1 forbids comparisons inside the kernel), then look up, then
+        # zero out-of-range rows and all_reduce.
         # ------------------------------------------------------------------
         local_input = input - self.vocab_start_index
         in_range = (local_input >= 0) & (local_input < self.local_num_embeddings)
         masked_input = local_input.clamp(0, self.local_num_embeddings - 1)
 
-        output = self._gather(api, masked_input)
+        if use_uc_kernel:
+            output = self._gather(api, masked_input)
+        else:
+            output = F.embedding(_as_long_indices(masked_input), self.weight)
 
         # Zero contributions from out-of-range indices.
         output = output * in_range.unsqueeze(-1).to(output.dtype)
@@ -185,8 +258,10 @@ class UCParallelEmbedding(MojoParallelEmbedding):
         return output
 
     # ----------------------------------------------------------------------
-    # UC kernel call helper.  Raises on missing API / launch error per
-    # "wheel 没实现的就直接给报错".
+    # UC kernel call helper.  Only reached when ``_is_kernel_profitable``
+    # has approved the shape, so any missing-API state at this point is a
+    # consistency bug (the picker found a matching API but the registry
+    # somehow lost it between calls) and is loud-raised.
     # ----------------------------------------------------------------------
     def _gather(self, api: str, indices: torch.Tensor) -> torch.Tensor:
         weight = self.weight.contiguous()
