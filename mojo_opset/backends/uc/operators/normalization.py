@@ -7,6 +7,7 @@ from mojo_opset.core import MojoRMSNorm
 
 from ._utils import _matrix_shape
 from ._utils import _uc_kernels
+from ._utils import run_kernel
 
 
 # Deployed `mojo_*norm_{bf16,fp16}` wheel kernels accept:
@@ -179,7 +180,19 @@ class UCResidualAddRMSNorm(MojoResidualAddRMSNorm):
         eps = float(self.variance_epsilon)
 
         # wheel ABI: (x, residual, weight, y, residual_out, M, N, eps)
-        _uc_kernels()[api](
+        # P1-G1 (2026-06-11): switched from `_uc_kernels()[api](...)` to
+        # `run_kernel(...)`, which routes through the cached ``FastKernel``
+        # path in ``_fast_dispatch`` and skips the per-call
+        # ``init_workspace()`` manifest re-parse + ``_stream_ptr(None)``
+        # query (~46 µs / call). The same FastKernel migration that W7-B
+        # applied to ``run_unary_kernel`` / ``run_binary_kernel`` now
+        # applies to ResAddRMSNorm. Other UC*Norm wrappers in this file
+        # still go through the slow path; migrating them is out-of-scope
+        # for this 1-kernel commit (see N1 in
+        # ``skills/uc-kernel-task-loop``).
+        run_kernel(
+            "mojo_residual_add_rmsnorm",
+            kernel_input.dtype,
             kernel_input,
             kernel_residual,
             weight,
