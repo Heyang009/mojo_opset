@@ -485,25 +485,7 @@ class IxformerQuantMoE(MojoQuantMoE):
             )
             top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
 
-        if self.dp_input and self.ep_size > 1:
-            full_indices = torch.empty((local_tokens * self.ep_size, *top_k_indices.shape[1:]), device=top_k_indices.device, dtype=top_k_indices.dtype)
-            indices_hdl = dist.all_gather_into_tensor(full_indices, top_k_indices.contiguous(), group=self.ep_group, async_op=True)
-
-            full_gates = torch.empty((local_tokens * self.ep_size, *top_k_gates.shape[1:]), device=top_k_gates.device, dtype=top_k_gates.dtype)
-            gates_hdl = dist.all_gather_into_tensor(full_gates, top_k_gates.contiguous(), group=self.ep_group, async_op=True)
-        else:
-            indices_hdl = None
-            gates_hdl = None
-
-        if full_hdl is not None:
-            full_hdl.wait()
-            hidden_states = full
-
         num_tokens, dim = hidden_states.shape
-
-        if indices_hdl is not None:
-            indices_hdl.wait()
-            top_k_indices = full_indices
 
         need_gpu_size = self.disable_sync or enable_cuda_graph
 
@@ -536,9 +518,6 @@ class IxformerQuantMoE(MojoQuantMoE):
             expand_tokens = num_tokens * self.top_k
         
         if sorted_token_ids.shape[0] == 0:
-            if gates_hdl is not None:
-                # avoid handle leakage
-                gates_hdl.wait()
             combined = torch.zeros(
                 num_tokens, self.hidden_size,
                 dtype=hidden_states.dtype, device=hidden_states.device,
@@ -667,10 +646,6 @@ class IxformerQuantMoE(MojoQuantMoE):
 
             # src_to_dst == -1 marks padding slots that must not be summed.
             reduce_mask = src_to_dst == -1
-
-            if gates_hdl is not None:
-                gates_hdl.wait()
-                top_k_gates = full_gates
 
             combined = ixf_f.moe_output_reduce_sum(
                 input=expert_outputs,
