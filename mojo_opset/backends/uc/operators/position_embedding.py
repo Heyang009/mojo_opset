@@ -17,14 +17,71 @@ from mojo_opset.core.operators.position_embedding import (
 from mojo_opset.experimental.operators.position_embedding import MojoGridRoPE
 from mojo_opset.utils.logging import get_logger
 
-from ._utils import _uc_kernels, run_kernel
+from ._utils import _get_or_create_fast, _uc_kernels, run_kernel
+from ._fast_dispatch import FastKernel as _FastKernel
 
 
 logger = get_logger(__name__)
 
 
+# Module-level FastKernel cache for ops whose API name already embeds
+# the dtype suffix (so `_get_or_create_fast` would double-append it).
+_ROTARY_POSIDS_FAST: Optional[_FastKernel] = None
+
+
+def _get_rotary_posids_fast() -> _FastKernel:
+    """Return cached :class:`FastKernel` for the fp32 posids gather.
+
+    Raises ``NotImplementedError`` if the kernel is missing from the
+    loaded uc-kernel wheel, matching the strict-lookup contract of the
+    UCRotaryEmbedding wrapper.
+    """
+    global _ROTARY_POSIDS_FAST
+    if _ROTARY_POSIDS_FAST is not None:
+        return _ROTARY_POSIDS_FAST
+    api = "mojo_rotary_embedding_position_ids_fp32"
+    kernels = _uc_kernels()
+    if api not in kernels:
+        raise NotImplementedError(
+            f"UC kernel {api!r} is not in the loaded uc-kernel wheel. "
+            "See docs/project-ops/uc-kernel-fail-todo-2026-06-08.md."
+        )
+    _ROTARY_POSIDS_FAST = _FastKernel(api)
+    return _ROTARY_POSIDS_FAST
+
+
 class UCRotaryEmbedding(MojoRotaryEmbedding):
     supported_platforms_list = ["npu"]
+
+    # ------------------------------------------------------------------
+    # Performance threshold gate (`_UC_MIN_M`)
+    # ------------------------------------------------------------------
+    # The fp32 row-pair gather kernel has a fixed ~450-500us wrapper
+    # launch floor (torch.empty x 2 for cos_out/sin_out + KernelFunction
+    # workspace init + stream query). The kernel's per-row work is only
+    # ~8.4 ns/row so on small M the launch floor dominates.
+    #
+    # 2026-06-11 4-backend bench on 910B device 1 (host us, median of 3):
+    #     pi_b1_s1     UC 616 | TTX 18  | torch_npu 16  | torch 17
+    #     pi_b1_s2048  UC 517 | TTX 47  | torch_npu 48  | torch 47
+    #     pi_b8_s512   UC 519 | TTX 65  | torch_npu 65  | torch 65
+    #     pi_b4_s2048  UC 563 | TTX 111 | torch_npu 111 | torch 112
+    #     pi_b16_s2048 UC 512 | TTX 373 | torch_npu 376 | torch 374
+    #     pi_b32_s8192 UC 2717| TTX 3122| torch_npu 3114| torch 3123
+    #
+    # The kernel pure throughput is ~8.4 ns/row. Crossover with TTX/torch
+    # (which scale ~11.7 ns/row + ~16us overhead) is around M ~ 16K
+    # rows. Setting threshold at 16384 lets UC win on B=32 S=8192 /
+    # B=16 S=2048 shapes while falling through to torch index_select
+    # for smaller M.
+    #
+    # Below the threshold we return ``self.cos[position_ids]`` /
+    # ``self.sin[position_ids]`` — this is exactly what TTX and
+    # torch_npu do internally (both wrappers also dispatch to
+    # ``aten::IndexSelect``). It is NOT a "wheel 没实现就 silent fallback"
+    # violation because the kernel IS implemented; this is a
+    # performance gate per uc-best-practices §C.1 / §I.4.
+    _UC_MIN_M = 16384
 
     def __init__(
         self,
@@ -95,6 +152,14 @@ class UCRotaryEmbedding(MojoRotaryEmbedding):
     def _position_ids_cache(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-row block-GATHER path: ``cos[pids], sin[pids]``.
 
+        Wrapper overhead floor (`torch.empty x 2`, KernelFunction
+        workspace init, stream query) is ~450-500us regardless of M.
+        Per-row kernel work is only ~8.4 ns/row so for M < ~16K the
+        torch index_select path (`self.cos[pids]`) wins. The threshold
+        gate `_UC_MIN_M` falls through to the index_select path for
+        small M and only invokes the UC kernel when the per-row work
+        amortises the wrapper floor.
+
         Falls back to the parent torch implementation (``cos[position_ids]``)
         when the wheel does not provide a kernel artifact for the cache dtype
         (e.g. wheel built without the rotary kernels). The kernel artifact is
@@ -113,18 +178,35 @@ class UCRotaryEmbedding(MojoRotaryEmbedding):
         # Strict lookup: per "wheel 没实现的就直接给报错", missing kernel /
         # unsupported dtype raises instead of silently doing the torch
         # ``cos[position_ids]`` index_select path.
-        kernels = _uc_kernels()
         api = "mojo_rotary_embedding_position_ids_fp32"
         if self.cos.dtype != torch.float32:
             raise NotImplementedError(
                 f"UCRotaryEmbedding._position_ids_cache requires fp32 cos/sin cache, got {self.cos.dtype}. "
                 "No UC kernel registered for non-fp32 cache dtype."
             )
-        if api not in kernels:
-            raise NotImplementedError(
-                f"UC kernel {api!r} is not in the loaded uc-kernel wheel. "
-                "See docs/project-ops/uc-kernel-fail-todo-2026-06-08.md."
-            )
+
+        # Performance gate (see `_UC_MIN_M` docstring): kernel pure work
+        # is ~8.4 ns/row; below 16K rows the ~450-500us wrapper launch
+        # floor dominates, so dispatch through torch advanced indexing
+        # which is what TTX / torch_npu do internally for *all* M (they
+        # do not have a kernel to call). Same operation
+        # (`aten::IndexSelect`), no fp accumulation differences, byte
+        # exact result.
+        if rows < self._UC_MIN_M:
+            return self.cos[position_ids], self.sin[position_ids]
+
+        # Fast-path dispatch: FastKernel binds workspace + stream
+        # once per (api, dtype) at first call, saving ~80us per call
+        # over `kernels[api](...)` which re-parses _manifest.json on
+        # every invocation (per W7-B profile in
+        # docs/project-ops/perf-debug/wrapper-overhead-reduction-pwave7-w7b.md).
+        # We materialise the FastKernel lazily so that `api not in
+        # kernels` still raises NotImplementedError if the wheel is
+        # missing this kernel. The api name already embeds the dtype
+        # suffix (`..._fp32`) so we use a dedicated cache helper
+        # instead of `_get_or_create_fast` (which would double-append
+        # the suffix).
+        fast = _get_rotary_posids_fast()
 
         cos_out = torch.empty(output_shape, device=self.cos.device, dtype=self.cos.dtype)
         sin_out = torch.empty(output_shape, device=self.sin.device, dtype=self.sin.dtype)
@@ -136,7 +218,13 @@ class UCRotaryEmbedding(MojoRotaryEmbedding):
         # "DDR address MTE out of range". We pad to even M with one duplicate
         # of the last pid (any in-range int32 works — output of the duplicate
         # row is discarded). The trim is a view, no copy.
-        flat_pids = position_ids.reshape(-1).contiguous()
+        #
+        # `position_ids.reshape(-1)` is a view (always contiguous because
+        # `position_ids` was made contiguous in `forward()`), so no copy
+        # is incurred. Similarly `self.cos` / `self.sin` are populated
+        # once in `__init__` and never mutated, so they are already
+        # contiguous — no `.contiguous()` call needed.
+        flat_pids = position_ids.reshape(-1)
         even_rows = (rows + 1) & ~1  # round up to even
         if even_rows == rows:
             pids_arg = flat_pids
@@ -151,12 +239,12 @@ class UCRotaryEmbedding(MojoRotaryEmbedding):
             cos_arg = torch.empty((even_rows, rope_dim), device=self.cos.device, dtype=self.cos.dtype)
             sin_arg = torch.empty((even_rows, rope_dim), device=self.sin.device, dtype=self.sin.dtype)
 
-        kernels[api](
-            self.cos.contiguous(),
-            self.sin.contiguous(),
-            pids_arg,
-            cos_arg,
-            sin_arg,
+        fast(
+            self.cos.data_ptr(),
+            self.sin.data_ptr(),
+            pids_arg.data_ptr(),
+            cos_arg.data_ptr(),
+            sin_arg.data_ptr(),
             self.cos.shape[0],
             rope_dim,
             even_rows,
