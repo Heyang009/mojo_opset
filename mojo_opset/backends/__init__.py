@@ -18,6 +18,7 @@ if is_deterministic:
 
 _SUPPORT_TTX_PLATFROM = ["npu", "ilu", "mlu"]
 _SUPPORT_TORCH_NPU_PLATFROM = ["npu"]
+_SUPPORT_UC_PLATFORM = ["npu"]
 _SUPPORT_IXFORMER_PLATFORM = ["ilu"]
 
 if platform in _SUPPORT_IXFORMER_PLATFORM:
@@ -31,3 +32,9 @@ if platform in _SUPPORT_TTX_PLATFROM:
 
 if platform in _SUPPORT_TORCH_NPU_PLATFROM:
     from .torch_npu import *
+
+if platform in _SUPPORT_UC_PLATFORM:
+    try:
+        from .uc import *
+    except ImportError as e:
+        logger.warning("Skipping uc backend (import failed): %s", e)
