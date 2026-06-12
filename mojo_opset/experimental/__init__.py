@@ -18,6 +18,7 @@ from .operators.attention import MojoPagedPrefillNSA
 from .operators.attention import MojoPagedPrefillSWAWithKVDequant
 from .operators.attention import MojoPrefillMLA
 from .operators.attention import MojoPrefillNSA
+from .operators.attention_gate import MojoFusedAttnGateConcat
 from .operators.attention_gate import MojoFusedAttnOutputGate
 from .operators.attention import MojoPagedPrefillSageGQA
 from .operators.deepep import MojoDeepEPCombine
@@ -25,6 +26,9 @@ from .operators.deepep import MojoDeepEPDispatch
 from .operators.gemm import MojoQuantBatchGemmReduceSum
 from .operators.indexer import MojoIndexer
 from .operators.indexer import MojoLightningIndexer
+from .operators.kv_cache import MojoGatherRopeStore
+from .operators.kv_cache import MojoPagedAttentionStoreKvCache
+from .operators.kv_cache import MojoPagedCacheDequant
 from .operators.kv_cache import MojoStorePagedMLAKVCache
 from .operators.moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .operators.moe import MojoMoEInitRoutingDynamicQuant
@@ -32,6 +36,7 @@ from .operators.normalization import MojoChannelRMSNorm
 from .operators.normalization import MojoGroupLayerNorm
 from .operators.position_embedding import MojoGridRoPE
 from .operators.position_embedding import MojoRelativeEmbedding
+from .operators.position_embedding import MojoRotaryEmbedding
 from .operators.store_lowrank import MojoStoreLowrank
 
 __all__ = [
@@ -52,8 +57,12 @@ __all__ = [
     "MojoPagedDecodeGQAWithKVDequant",
     "MojoPagedPrefillSWAWithKVDequant",
     "MojoPagedDecodeSWAWithKVDequant",
+    "MojoFusedAttnGateConcat",
     "MojoFusedAttnOutputGate",
     "MojoPagedPrefillSageGQA",
+    "MojoGatherRopeStore",
+    "MojoPagedAttentionStoreKvCache",
+    "MojoPagedCacheDequant",
     "MojoStorePagedMLAKVCache",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
@@ -61,6 +70,7 @@ __all__ = [
     "MojoChannelRMSNorm",
     "MojoRelativeEmbedding",
     "MojoGridRoPE",
+    "MojoRotaryEmbedding",
     "MojoStoreLowrank",
     "MojoIndexer",
     "MojoDeepEPDispatch",
