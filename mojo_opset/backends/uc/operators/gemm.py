@@ -92,6 +92,16 @@ class UCQuantGemm(MojoQuantGemm):
             raise ValueError(f"input must be 2D, got shape {tuple(input.shape)}.")
         if input.dtype != torch.int8:
             raise NotImplementedError(f"UC QuantGemm supports int8 input, got {input.dtype}.")
+        # Defensive: ensure weight / weight_scale live on the same device as ``input`` BEFORE we
+        # hand raw pointers to the wheel kernel. If the caller created the op without an explicit
+        # ``.to(device)`` (e.g. ``MojoQuantGemm(...)`` instead of ``MojoQuantGemm(...).to(x.device)``),
+        # ``self.weight`` and ``self.weight_scale`` stay on CPU. Passing CPU pointers to an NPU
+        # kernel triggers a silent ``SUSPECT MEM ERROR 507055`` (see docs perf-debug
+        # op-MojoQuantGemm-2026-06-11.md). Auto-move keeps the wrapper robust.
+        if self.weight.device != input.device:
+            self.weight = self.weight.to(input.device)
+        if self.weight_scale.device != input.device:
+            self.weight_scale = self.weight_scale.to(input.device)
         if self.trans_weight:
             weight = self.weight.t().contiguous()
         else:

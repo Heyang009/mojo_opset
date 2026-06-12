@@ -50,7 +50,7 @@ def test_quant_gemm_perf(x_i8, w_i8, x_scale, w_scale, output_dtype, trans_weigh
         out_features=w_scale.numel(),
         output_dtype=output_dtype,
         trans_weight=trans_weight,
-    )
+    ).to(x_i8.device)
     op.load_state_dict(
         {
             "weight": w_i8,
