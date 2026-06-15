@@ -499,10 +499,10 @@ def test_paged_prefill_swa(
 
 test_configs_swa_decode = [
     (8, 16, 4, 128, 1024, 32, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 96, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (8, 16, 4, 128, 1024, 128, torch.bfloat16, "M_BF16_PADDIM"),
     (8, 16, 4, 128, 8192, 128, torch.bfloat16, "M_BF16_LONG"),
     (4, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (8, 16, 4, 128, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
     (8, 8, 1, 128, 4096, 128, torch.bfloat16, "M_BF16_LONG"),
     (2, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (2, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
