@@ -2321,7 +2321,7 @@ class DeepseekV4MoE(nn.Module):
         return topk_idx.to(torch.int32), topk_weight
 
     def forward(self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor] = None,
-                is_prefill: bool = True) -> torch.Tensor:
+                is_prefill: bool = True, cur_topk_list: Optional[torch.Tensor] = None) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, self.hidden_size).to(torch.bfloat16)
         if input_ids is not None:
@@ -2339,6 +2339,8 @@ class DeepseekV4MoE(nn.Module):
 
         logits = F.linear(hidden_states_flat.float(), self.gate)
         topk_idx, topk_weight = self._gate_topk(logits, input_ids)
+        if cur_topk_list is not None:
+            topk_idx = cur_topk_list.to(device=topk_idx.device, dtype=torch.int32)
 
         if self.ep_size > 1 and self.ep_group is not None:
             n_tokens = hidden_states_flat.shape[0]
@@ -2509,6 +2511,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         is_prefill: bool = True,
         attn_inputs: Optional[dict] = None,
         attn_metadata: Optional[dict] = None,
+        cur_topk_list: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if _DSV4_LAYER_PROFILE:
@@ -2550,7 +2553,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         hidden_states = self.ffn_norm(hidden_states)
         with _profile_timer(self.layer_idx, "moe"):
-            hidden_states = self.mlp(hidden_states, input_ids=input_ids, is_prefill=is_prefill)
+            hidden_states = self.mlp(
+                hidden_states,
+                input_ids=input_ids,
+                is_prefill=is_prefill,
+                cur_topk_list=cur_topk_list,
+            )
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         if _DSV4_LAYER_PROFILE:
@@ -2606,6 +2614,7 @@ class DeepseekV4Model(nn.Module):
         attn_inputs: Optional[dict] = None,
         attn_metadata: Optional[dict] = None,
         q_lens: Optional[torch.Tensor] = None,
+        cur_topk_list: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, PagedDummyCache]:
         device = input_ids.device
@@ -2669,6 +2678,7 @@ class DeepseekV4Model(nn.Module):
                 attn_inputs=attn_inputs.get(layer_idx) if attn_inputs is not None else None,
                 attn_metadata=attn_metadata,
                 q_lens=q_lens,
+                cur_topk_list=cur_topk_list,
             )
 
         hidden_states = self._hc_head(hidden_states)
@@ -3005,9 +3015,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.attn_tp_size = int(self.parallel_config.get("attn_tp_size", 1))
         self.attn_dp_size = int(self.parallel_config.get("attn_dp_size", 1))
         self.prefill_dp_size = int(self.parallel_config.get("prefill_dp_size", 1))
+        self.moe_tp_size = int(self.parallel_config.get("moe_tp_size", 1))
         self.lmhead_tp_size = int(self.parallel_config.get("lmhead_tp_size", 1))
         self.use_parallelize_module_tp = bool(int(self.parallel_config.get("use_parallelize_module_tp", 0)))
         self.o_proj_tp_size = int(self.parallel_config.get("o_proj_tp_size", self.attn_tp_size))
+        self.experts_per_rank = config.n_routed_experts // max(self.ep_size, 1)
+        self.top_k = config.num_experts_per_tok
+        self.perfect_eplb = os.getenv("MOJO_PERFECT_EPLB", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.lmhead_tp_rank, self.lmhead_vocab_start, self.lmhead_vocab_end, self.local_vocab_size = (
             get_deepseek_v4_lmhead_tp_partition(
                 config.vocab_size,
@@ -3023,6 +3037,43 @@ class DeepseekV4ForCausalLM(nn.Module):
             bias=False,
         )
         self.hccl_comm_dict = {}
+
+    def gen_cur_topk_idx(
+        self,
+        is_prefill: bool,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.perfect_eplb:
+            return None
+        global_rank = dist.get_rank() if dist.is_initialized() else self.global_rank
+        if is_prefill:
+            if self.ep_size != 1:
+                tokens_per_rank = batch_size * seq_len // max(self.attn_tp_size, 1)
+            else:
+                tokens_per_rank = batch_size * seq_len * max(self.attn_dp_size, 1)
+            step = tokens_per_rank * self.top_k
+            topk_list = (
+                torch.arange(step, dtype=torch.int32, device=device) + int(global_rank)
+            ) % self.config.n_routed_experts
+        elif self.moe_tp_size > 1:
+            tokens_per_rank = batch_size * self.top_k * seq_len
+            offsets = torch.arange(self.ep_size, dtype=torch.int32, device=device) * self.experts_per_rank
+            token_offsets = torch.arange(tokens_per_rank, dtype=torch.int32, device=device)
+            topk_list = (offsets[:, None] + token_offsets[None, :]).reshape(-1)
+            tokens_per_rank = batch_size * seq_len
+        else:
+            expanded_tokens = batch_size * self.top_k * seq_len
+            step_gap = self.config.n_routed_experts // max(self.ep_size, 1)
+            expanded_offset = expanded_tokens * global_rank + global_rank
+            idx = torch.arange(expanded_tokens, dtype=torch.int64, device=device) + int(expanded_offset)
+            col = idx % max(self.ep_size, 1)
+            row = (idx // max(self.ep_size, 1)) % step_gap
+            topk_list = (row + col * step_gap).to(torch.int32)
+            tokens_per_rank = batch_size * seq_len
+        return topk_list.view(tokens_per_rank, -1)
+
     def _gather_cp_prefill_hidden_states(self, hidden_states: torch.Tensor, attn_metadata: dict) -> torch.Tensor:
         return gather_cp_prefill_hidden_states(
             hidden_states,
@@ -3045,11 +3096,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         q_lens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, PagedDummyCache, torch.Tensor]:
+        cur_topk_list = self.gen_cur_topk_idx(is_prefill, input_ids.shape[0], input_ids.shape[1], input_ids.device)
         hidden_states, past_key_values = self.model(
             input_ids, attention_mask=attention_mask, position_ids=position_ids,
             past_key_values=past_key_values, use_cache=use_cache,
             is_prefill=is_prefill, attn_inputs=attn_inputs,
             attn_metadata=attn_metadata, context_lens=context_lens, q_lens=q_lens,
+            cur_topk_list=cur_topk_list,
         )
         mtp_hidden = hidden_states
         if is_prefill:
