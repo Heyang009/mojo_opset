@@ -721,7 +721,7 @@ class MojoPagedDecodeSWA(MojoOperator):
 
             if self.is_causal:
                 s_mask = _generate_window_mask(
-                    1,
+                    q_i.shape[1],
                     kv_seq_len,
                     self.local_window_size,
                     self.global_window_size,
