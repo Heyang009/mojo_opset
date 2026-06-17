@@ -911,11 +911,19 @@ def swa_paged_decode_impl(
     if q.ndim == 4:
         batch_size, seq_lens, num_q_heads, head_dim = q.shape
         stride_qb, stride_qs, stride_qh, stride_qd = q.stride()
+        stride_ob = seq_lens * num_q_heads * head_dim
+        stride_os = num_q_heads * head_dim
+        stride_oh = head_dim
+        stride_od = 1
     else:
         batch_size, num_q_heads, head_dim = q.shape
         stride_qb, stride_qh, stride_qd = q.stride()
         seq_lens = 1
         stride_qs = 1
+        stride_ob = num_q_heads * head_dim
+        stride_os = 1
+        stride_oh = head_dim
+        stride_od = 1
 
     num_total_blocks, num_kv_heads, page_size, head_dim_cache = key_cache.shape
 
