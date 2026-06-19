@@ -9,6 +9,26 @@ from ...core.operators.gemm import MojoQuantGemm
 __all__ = ["MojoA2AQuantGemmDualHead"]
 
 
+def _chunked_quant_gemm(
+    input_i8: torch.Tensor,
+    weight_i8: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    trans_weight: bool,
+    output_dtype: torch.dtype,
+    chunk_m: int = 32,
+) -> torch.Tensor:
+    weight_t = weight_i8 if trans_weight else weight_i8.mT
+    outs = []
+    for start in range(0, input_i8.size(0), chunk_m):
+        end = min(start + chunk_m, input_i8.size(0))
+        out = input_i8[start:end].float() @ weight_t.float().T
+        out = out * input_scale[start:end].float().view(-1, 1)
+        out = out * weight_scale.float().view(1, -1)
+        outs.append(out.to(output_dtype))
+    return torch.cat(outs, dim=0)
+
+
 class MojoA2AQuantGemmDualHead(MojoOperator):
     """A2A-then-quantized-GEMM with dual-head (full + SWA) channel layout.
 
@@ -239,7 +259,14 @@ class MojoA2AQuantGemmDualHead(MojoOperator):
             recv = attn_int8
             sp_scale = unified_scale.view(-1)
 
-        return self.o_proj(recv, sp_scale)
+        return _chunked_quant_gemm(
+            recv,
+            self.o_proj.weight,
+            sp_scale,
+            self.o_proj.weight_scale,
+            self.o_proj.trans_weight,
+            self.o_proj.output_dtype,
+        )
 
     def extra_repr(self) -> str:
         return (

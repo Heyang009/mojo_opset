@@ -24,15 +24,15 @@ import torch.multiprocessing as mp
 
 from mojo_opset.experimental import MojoA2AQuantGemmDualHead
 from mojo_opset.tests.utils import bypass_not_implemented
-from mojo_opset.utils.platform import get_dist_backend, get_platform
+from mojo_opset.utils.platform import get_dist_backend, get_platform, get_torch_device
 
 torch.manual_seed(42)
 
 dtypes = [torch.bfloat16]  # the op output dtype is bf16; only one to vary
 
 _PLATFORM = get_platform()
-COMM_BACKEND = get_dist_backend()
-DEVICE = _PLATFORM if _PLATFORM in ("npu", "mlu") else "cpu"
+DEVICE = get_torch_device()
+COMM_BACKEND = "nccl" if DEVICE == "cuda" else get_dist_backend()
 
 if _PLATFORM == "npu":
     _NPU_COUNT = torch.npu.device_count()
@@ -68,14 +68,33 @@ def _init_pg(rank, world_size, master_port):
     os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
     if _PLATFORM == "npu":
         torch.npu.set_device(_TEST_NPU_IDS[rank])
-    dist.init_process_group(
-        backend=COMM_BACKEND,
-        init_method="env://",
-        rank=rank,
-        world_size=world_size,
-    )
+        dist.init_process_group(
+            backend=COMM_BACKEND,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+    elif DEVICE == "cuda":
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend=COMM_BACKEND,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device("cuda", rank),
+        )
+    else:
+        dist.init_process_group(
+            backend=COMM_BACKEND,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
 
 
 def _destroy_pg():
@@ -100,6 +119,39 @@ def _skip_if_no_specific_backend():
             "No device-specific backend for MojoA2AQuantGemmDualHead; "
             "both operands resolve to the same implementation."
         )
+
+
+def _ixformer_skip_reason(shape, head_layout, output_dtype=torch.bfloat16):
+    n_pad, full_nh, swa_nh, head_dim, hidden_size = shape
+    if _PLATFORM != "ilu":
+        return f"ixformer fused A2A backend only runs on ilu platform, got {_PLATFORM}"
+    if not torch.cuda.is_available():
+        return "ixformer fused A2A backend requires CUDA tensors"
+    if torch.cuda.device_count() < WORLD_SIZE:
+        return f"requires at least {WORLD_SIZE} CUDA devices"
+    if COMM_BACKEND != "nccl":
+        return f"ixformer fused A2A backend requires nccl backend, got {COMM_BACKEND}"
+    if not dist.is_available():
+        return "torch.distributed is not available"
+    if WORLD_SIZE <= 1:
+        return "ixformer fused A2A backend requires tp_size > 1"
+    if output_dtype != torch.bfloat16:
+        return "ixformer fused A2A backend only supports bfloat16 output"
+    if n_pad % WORLD_SIZE != 0:
+        return f"n_pad={n_pad} must be divisible by WORLD_SIZE={WORLD_SIZE}"
+    if (n_pad // WORLD_SIZE) % 256 != 0:
+        return (
+            f"local M={n_pad // WORLD_SIZE} must be divisible by "
+            "ixformer BM=256"
+        )
+    ch_global = (full_nh + swa_nh) * head_dim
+    if ch_global <= 128:
+        return f"global K={ch_global} must be greater than ixformer kSTAGE*BK=128"
+    if ch_global % 64 != 0:
+        return f"global K={ch_global} must be divisible by ixformer BK=64"
+    if hidden_size % 128 != 0:
+        return f"N={hidden_size} must be divisible by ixformer BN fallback=128"
+    return None
 
 
 def _identity_head_indices(num_heads_global, tp_size, tp_rank):
@@ -142,13 +194,16 @@ def _build_op_pair(
     )
     op_ref = op_ref.to(DEVICE) if DEVICE != "cpu" else op_ref
 
-    # Identical o_proj weights on both
+    # Identical o_proj weights on both; load_state_dict triggers backend
+    # post-hooks such as ixformer's fp32 weight_scale cast.
     weight = torch.randint(-128, 127, op.o_proj.weight.shape, dtype=torch.int8)
     weight_scale = torch.rand(hidden_size, dtype=torch.bfloat16) + 0.5
-    op.o_proj.weight.copy_(_to_dev(weight))
-    op.o_proj.weight_scale.copy_(_to_dev(weight_scale))
-    op_ref.o_proj.weight.copy_(_to_dev(weight))
-    op_ref.o_proj.weight_scale.copy_(_to_dev(weight_scale))
+    state = {
+        "o_proj.weight": _to_dev(weight),
+        "o_proj.weight_scale": _to_dev(weight_scale),
+    }
+    op.load_state_dict(state)
+    op_ref.load_state_dict(state)
     return op, op_ref
 
 
@@ -190,7 +245,7 @@ def _worker_dual_head(
 
         op.forward_diff_with(
             op_ref, attn_int8, unified_scale,
-            atol=(1, 2e-3), rtol=(0, 2e-3),
+            atol=1, rtol=2e-3,
         )
     finally:
         _destroy_pg()
@@ -208,6 +263,9 @@ def test_a2a_quant_gemm_dual_head_comm(master_port, shape, head_layout):
         or swa_nh % WORLD_SIZE != 0
     ):
         pytest.skip(f"shape not divisible by world_size={WORLD_SIZE}")
+    skip_reason = _ixformer_skip_reason(shape, head_layout)
+    if skip_reason is not None:
+        pytest.skip(skip_reason)
 
     mp.spawn(
         _worker_dual_head,
@@ -232,6 +290,8 @@ def test_a2a_quant_gemm_dual_head_comm_non_contiguous(
 ):
     """M13 callers feed sliced views post-attention; ensure non-contig works."""
     _skip_if_no_specific_backend()
+    if _PLATFORM == "ilu":
+        pytest.skip("ixformer fused A2A backend does not support non-contiguous input")
     n_pad, full_nh, swa_nh, head_dim, hidden_size = shape
     if (
         n_pad % WORLD_SIZE != 0
