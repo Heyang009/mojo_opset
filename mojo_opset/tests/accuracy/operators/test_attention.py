@@ -46,9 +46,12 @@ def generate_paged_decode_data(
         query = torch.randn(batch_size, num_q_heads, head_dim, dtype=dtype)
     if max_seq_len > 0:
         total_seq_lens = torch.randint(0, max_seq_len, (batch_size,), dtype=torch.int32)
-        total_seq_lens = torch.clamp(total_seq_lens, min=1)
     else:
         total_seq_lens = torch.randperm(batch_size, dtype=torch.int32)
+
+    # the seqlens of kv cache must larger than seq_lens of query
+    min_seq_len = seq_len if seq_len != -1 else 1
+    total_seq_lens = torch.clamp(total_seq_lens, min=min_seq_len)
 
     max_total_seq_len = total_seq_lens.max().item()
     max_num_blocks_per_seq = (max_total_seq_len + block_size - 1) // block_size
@@ -1677,7 +1680,6 @@ def test_paged_decode_swa(
         rtol=rtol,
     )
 
-
 test_configs_swa_nstep_decode = [
     (4, 1, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
     (8, 1, 16, 8, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
@@ -1685,7 +1687,7 @@ test_configs_swa_nstep_decode = [
     (8, 2, 16, 8, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
     (8, 3, 8, 1, 128, 4096, 128, torch.bfloat16, "M_BF16_LONG"),
     (2, 3, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
-    (2, 4, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
+    (2, 1, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
     (2, 4, 8, 2, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP1"),
     (2, 4, 24, 8, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP2"),
 ]

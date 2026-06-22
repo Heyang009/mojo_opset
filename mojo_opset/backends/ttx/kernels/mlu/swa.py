@@ -91,6 +91,7 @@ def _swa_split_blocks(
     
     return num_global_window_blocks, non_global_window_start_block, num_total_blocks
 
+
 @triton.jit
 def _swa_transposed_range_blocks(
     kv_block_start_id, 
@@ -757,7 +758,6 @@ def _swa_paged_decode_kernel(
     GQA_HEAD_STRIDE: tl.constexpr = NUM_KV_HEADS if GQA_INTERLEAVE else 1
     NUM_Q_HEAD_BLOCKS_PER_KV_HEAD: tl.constexpr = tl.cdiv(GQA_GROUP_SIZE, BLOCK_SIZE_Q_HEADS)
 
-
     pid = tl.program_id(0)
     n_progs = tl.num_programs(0)
 
@@ -783,8 +783,8 @@ def _swa_paged_decode_kernel(
         acc = tl.zeros((BLOCK_SIZE_Q_HEADS * Q_SEQLEN, BLOCK_SIZE_D), dtype=tl.float32)
 
         num_global_window_blocks, non_global_window_start_block, num_total_blocks = _swa_split_blocks(
-            kv_seq_len - 1,
-            1,
+            kv_seq_len - Q_SEQLEN,
+            Q_SEQLEN,
             kv_seq_len,
             BLOCK_SIZE_N,
             True,
@@ -817,13 +817,18 @@ def _swa_paged_decode_kernel(
                 block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
                 order=(1, 0),
             )
+
             gw_mask = (kv_block_start + tl.arange(0, BLOCK_SIZE_N)) < GLOBAL_WINDOW
-            if LOCAL_WINDOW is not None:
-                sw_mask = (kv_block_start + tl.arange(0, BLOCK_SIZE_N) + LOCAL_WINDOW) >= (kv_seq_len - 1)
-                gw_mask = gw_mask | sw_mask
+            gw_mask = gw_mask[None, :]
             kv_mask = tl.arange(0, BLOCK_SIZE_N) < kv_block_len
-            mask = gw_mask & kv_mask
-            
+            seq_offsets = tl.arange(0, BLOCK_SIZE_Q_HEADS * Q_SEQLEN) // BLOCK_SIZE_Q_HEADS
+            base = kv_block_start + tl.arange(0, BLOCK_SIZE_N)
+            if LOCAL_WINDOW is not None:
+                sw_mask = base[None, :] + LOCAL_WINDOW >= kv_seq_len - (Q_SEQLEN - seq_offsets[:, None])
+                gw_mask = gw_mask | sw_mask
+            casul_mask = base[None, :] - seq_offsets[:, None]  <= kv_seq_len - Q_SEQLEN
+            mask = gw_mask & kv_mask[None, :] & casul_mask
+
             acc, l_i, m_i = _decode_acc_fwd_MxN(
                 acc, 
                 l_i, 
@@ -865,14 +870,16 @@ def _swa_paged_decode_kernel(
                 block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
                 order=(1, 0),
             )
-            
+
             kv_mask = tl.arange(0, BLOCK_SIZE_N) < kv_block_len
+            seq_offsets = tl.arange(0, BLOCK_SIZE_Q_HEADS * Q_SEQLEN) // BLOCK_SIZE_Q_HEADS
+            base = kv_block_start + tl.arange(0, BLOCK_SIZE_N)
+            casul_mask = base[None, :] - seq_offsets[:, None] <= kv_seq_len - Q_SEQLEN
             if LOCAL_WINDOW is not None:
-                sw_mask = (kv_block_start + tl.arange(0, BLOCK_SIZE_N) + LOCAL_WINDOW) >= (kv_seq_len - 1)
-                mask = kv_mask & sw_mask
+                sw_mask = base[None, :] + LOCAL_WINDOW >= kv_seq_len - (Q_SEQLEN - seq_offsets[:, None])
+                mask = sw_mask & kv_mask[None, :] & casul_mask
             else:
-                mask = kv_mask
-            
+                mask = kv_mask[None, :] & casul_mask 
             acc, l_i, m_i = _decode_acc_fwd_MxN(
                 acc,
                 l_i, 
@@ -915,6 +922,8 @@ def swa_paged_decode_impl(
         stride_os = num_q_heads * head_dim
         stride_oh = head_dim
         stride_od = 1
+        assert torch.all(seqlens >= seq_lens), f"the seqlens of kv cache must larger than seq_lens({seq_lens}) of q, \
+            but: {seqlens[torch.where(seqlens >= seq_lens)]}"
     else:
         batch_size, num_q_heads, head_dim = q.shape
         stride_qb, stride_qh, stride_qd = q.stride()
