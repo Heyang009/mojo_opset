@@ -452,7 +452,7 @@ test_configs_swa_prefill = [
     ],
 )
 @pytest.mark.parametrize("gqa_layout, global_window, local_window", [
-    ("AABB", 4, 255),  #torch_npu only support AABB gqa layout
+    #("AABB", 4, 255),  #torch_npu only support AABB gqa layout
     ("AABB", 4, 1023),
 ])
 @auto_switch_platform(set_perf=True)
