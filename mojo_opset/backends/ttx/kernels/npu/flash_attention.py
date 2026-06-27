@@ -657,6 +657,341 @@ def paged_attention_prefill_impl(
     return o
 
 
+# ---------------------------------------------------------------------------
+# Flash Decode helpers (mirrors AscendC CheckFlashDecode / SplitS2 logic)
+# ---------------------------------------------------------------------------
+
+def _should_use_flash_decode(
+    batch_size: int,
+    num_kv_heads: int,
+    group_size: int,
+    max_kv_len: int,
+    cube_num: int,
+) -> bool:
+    """Mirrors AscendC FusedInferAttentionScoreTilingImpl::CheckFlashDecode.
+
+    FD is triggered when B*N_KV tasks are too few to saturate all cube cores
+    and the KV sequence is long enough to benefit from S2 splitting.
+    """
+    _FD_BN_RATIO = 0.4
+    if max_kv_len < 256:
+        return False
+    loop_times = batch_size * num_kv_heads
+    if loop_times >= _FD_BN_RATIO * cube_num:
+        return False
+    # MHA / MQA: always FD once loop_times threshold is met
+    if group_size == 1:
+        return True
+    # GQA: additionally require long-enough KV to amortise workspace overhead
+    return max_kv_len >= 2048
+
+
+def _compute_kv_split_parts(
+    batch_size: int,
+    num_kv_heads: int,
+    max_kv_len: int,
+    cube_num: int,
+) -> int:
+    """Mirrors AscendC FusedInferAttentionScoreTilingImpl::SplitS2.
+
+    Start with aicNum/loopTimes and reduce until each split covers at least
+    KV_SPLIT_LIMIT tokens (experience value matching sInnerFactor_=128 path).
+    """
+    KV_SPLIT_LIMIT = 256  # matches kvSplitLimit when sInnerFactor_<=256
+    loop_times = batch_size * num_kv_heads
+    kv_split_parts = max(cube_num // loop_times, 1)
+    while kv_split_parts > 1 and (max_kv_len // kv_split_parts) < KV_SPLIT_LIMIT:
+        kv_split_parts -= 1
+    return kv_split_parts
+
+
+# ---------------------------------------------------------------------------
+# Flash Decode Phase-1 kernel: Cube cores compute partial attention per split
+#
+# Core assignment (mirrors AscendC SplitS2 + gsMerge):
+#   Each program handles one (batch, kv_head, s2_split) triple and processes
+#   all GROUP_SIZE Q-heads simultaneously (equivalent to AscendC's gsMerge).
+#   Tasks are: total = B * N_KV * KV_SPLIT_PARTS, cycled across cube_num cores.
+#
+# Workspace written per program:
+#   acc_ws  [ws_task_idx, g, d]  – locally-normalised partial output (float32)
+#   lse_ws  [ws_task_idx, g]     – m_i + log(l_i) per G-head (float32)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def paged_decode_fd_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    seqlens_ptr,
+    block_tables_ptr,
+    acc_ws_ptr,
+    lse_ws_ptr,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_k_block,
+    stride_k_head,
+    stride_k_blksz,
+    stride_k_dim,
+    stride_v_block,
+    stride_v_head,
+    stride_v_blksz,
+    stride_v_dim,
+    stride_bt_batch,
+    stride_bt_block,
+    stride_aws_task,
+    stride_aws_g,
+    stride_aws_d,
+    stride_lse_task,
+    stride_lse_g,
+    softmax_scale,
+    BATCH_SIZE,
+    KV_SPLIT_PARTS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GQA_INTERLEAVE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+
+    pid = tl.program_id(0)
+    n_progs = tl.num_programs(0)
+    total_fd_tasks = BATCH_SIZE * NUM_KV_HEADS * KV_SPLIT_PARTS
+
+    for fd_task_id in range(pid, total_fd_tasks, n_progs):
+        split_idx = fd_task_id % KV_SPLIT_PARTS
+        kv_task   = fd_task_id // KV_SPLIT_PARTS
+        b_id      = kv_task // NUM_KV_HEADS
+        kv_head_id = kv_task % NUM_KV_HEADS
+
+        kv_seq_len = tl.load(seqlens_ptr + b_id)
+
+        # Partition the KV sequence evenly across splits
+        chunk_size = tl.cdiv(kv_seq_len, KV_SPLIT_PARTS)
+        kv_start   = split_idx * chunk_size
+        kv_end     = tl.minimum(kv_start + chunk_size, kv_seq_len)
+
+        # Workspace slot for this (b, kv_head, split)
+        ws_task_idx = (b_id * NUM_KV_HEADS + kv_head_id) * KV_SPLIT_PARTS + split_idx
+
+        g_offsets = tl.arange(0, GROUP_SIZE)
+        if GQA_INTERLEAVE:
+            q_head_ids = kv_head_id + g_offsets * NUM_KV_HEADS
+        else:
+            q_head_ids = kv_head_id * GROUP_SIZE + g_offsets
+
+        offs_d = tl.arange(0, BLOCK_SIZE_D)
+
+        # Load Q for all G-heads: [G, D]
+        q_ptrs = (
+            q_ptr
+            + b_id * stride_qb
+            + q_head_ids[:, None] * stride_qh
+            + offs_d[None, :] * stride_qd
+        )
+        q = tl.load(q_ptrs, mask=offs_d[None, :] < HEAD_DIM, other=0.0)
+
+        m_i = tl.full((GROUP_SIZE,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
+        acc = tl.zeros((GROUP_SIZE, BLOCK_SIZE_D), dtype=tl.float32)
+
+        # Iterate over KV blocks within [kv_start, kv_end)
+        num_kv_blocks = tl.cdiv(kv_end - kv_start, BLOCK_SIZE_N)
+
+        for kv_block_id in range(num_kv_blocks):
+            kv_block_start = kv_start + kv_block_id * BLOCK_SIZE_N
+            kv_block_end   = tl.minimum(kv_block_start + BLOCK_SIZE_N, kv_end)
+            kv_block_len   = kv_block_end - kv_block_start
+
+            logical_page_id       = kv_block_start // PAGE_SIZE
+            kv_block_start_in_page = kv_block_start % PAGE_SIZE
+            physical_page_id = tl.load(
+                block_tables_ptr
+                + b_id * stride_bt_batch
+                + logical_page_id * stride_bt_block
+            )
+
+            K_T_block_ptr = tl.make_block_ptr(
+                base=(
+                    k_cache_ptr
+                    + physical_page_id * stride_k_block
+                    + kv_head_id * stride_k_head
+                    + kv_block_start_in_page * stride_k_blksz
+                ),
+                shape=(HEAD_DIM, kv_block_len),
+                strides=(stride_k_dim, stride_k_blksz),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_N),
+                order=(0, 1),
+            )
+            V_block_ptr = tl.make_block_ptr(
+                base=(
+                    v_cache_ptr
+                    + physical_page_id * stride_v_block
+                    + kv_head_id * stride_v_head
+                    + kv_block_start_in_page * stride_v_blksz
+                ),
+                shape=(kv_block_len, HEAD_DIM),
+                strides=(stride_v_blksz, stride_v_dim),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
+                order=(1, 0),
+            )
+
+            mask = tl.arange(0, BLOCK_SIZE_N) < kv_block_len
+
+            k_T = tl.load(K_T_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            v   = tl.load(V_block_ptr,   boundary_check=(0, 1), padding_option="zero")
+
+            qk = tl.dot(q, k_T)  # [G, BLOCK_N]
+            qk = qk * softmax_scale
+            qk = tl.where(mask[None, :], qk, float("-inf"))
+
+            m_ij = tl.maximum(
+                m_i, tl.max(qk, 1, propagate_nan=True),
+                propagate_nan=tl.PropagateNan.ALL,
+            )
+            qk    = qk - m_ij[:, None]
+            p     = tl.math.exp(qk)
+            l_ij  = tl.sum(p, 1)
+            alpha = tl.math.exp(m_i - m_ij)
+
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None] + tl.dot(p.to(k_T.dtype), v)
+            m_i = m_ij
+
+        # Locally normalise acc by this split's softmax denominator (l_i).
+        # The reduce kernel will re-weight each split's contribution using lse_i.
+        # Empty splits (kv_start >= kv_seq_len) have l_i=0; guard against div-0.
+        l_i_safe = tl.where(l_i > 0, l_i, 1.0)
+        acc      = acc / l_i_safe[:, None]
+        lse_i    = tl.where(l_i > 0, m_i + tl.math.log(l_i), float("-inf"))
+
+        # Write lse to workspace
+        lse_ptrs = (
+            lse_ws_ptr
+            + ws_task_idx * stride_lse_task
+            + g_offsets * stride_lse_g
+        )
+        tl.store(lse_ptrs, lse_i)
+
+        # Write acc to workspace
+        acc_ptrs = (
+            acc_ws_ptr
+            + ws_task_idx * stride_aws_task
+            + g_offsets[:, None] * stride_aws_g
+            + offs_d[None, :] * stride_aws_d
+        )
+        tl.store(acc_ptrs, acc, mask=offs_d[None, :] < HEAD_DIM)
+
+
+# ---------------------------------------------------------------------------
+# Flash Decode Phase-2 kernel: Vector cores merge partial results
+#
+# Mirrors AscendC FiaBlockVecFlashDecode::FlashDecode + ComputeScaleValue.
+# Each program handles one (batch, kv_head) pair and merges KV_SPLIT_PARTS
+# partial outputs into the final attention output.
+#
+# Merge formula (online softmax correction):
+#   lse_max_g  = max_i(lse_i_g)          per G-head
+#   w_i_g      = exp(lse_i_g - lse_max_g)
+#   W_g        = sum_i(w_i_g)
+#   out_g      = sum_i (w_i_g / W_g) * acc_ws[i, g, :]
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def paged_decode_fd_reduce_kernel(
+    acc_ws_ptr,
+    lse_ws_ptr,
+    o_ptr,
+    seqlens_ptr,
+    stride_aws_task,
+    stride_aws_g,
+    stride_aws_d,
+    stride_lse_task,
+    stride_lse_g,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    BATCH_SIZE,
+    KV_SPLIT_PARTS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GQA_INTERLEAVE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+
+    pid    = tl.program_id(0)
+    n_progs = tl.num_programs(0)
+    total_reduce_tasks = BATCH_SIZE * NUM_KV_HEADS
+
+    for reduce_task_id in range(pid, total_reduce_tasks, n_progs):
+        b_id       = reduce_task_id // NUM_KV_HEADS
+        kv_head_id = reduce_task_id % NUM_KV_HEADS
+
+        g_offsets = tl.arange(0, GROUP_SIZE)
+        if GQA_INTERLEAVE:
+            q_head_ids = kv_head_id + g_offsets * NUM_KV_HEADS
+        else:
+            q_head_ids = kv_head_id * GROUP_SIZE + g_offsets
+
+        offs_d = tl.arange(0, BLOCK_SIZE_D)
+
+        # Pass 1: find per-G-head max lse across all splits (numerical stability)
+        lse_max = tl.full((GROUP_SIZE,), float("-inf"), dtype=tl.float32)
+        for split_idx in tl.static_range(KV_SPLIT_PARTS):
+            ws_task_idx = (b_id * NUM_KV_HEADS + kv_head_id) * KV_SPLIT_PARTS + split_idx
+            lse_ptrs = (
+                lse_ws_ptr
+                + ws_task_idx * stride_lse_task
+                + g_offsets * stride_lse_g
+            )
+            lse_max = tl.maximum(lse_max, tl.load(lse_ptrs))
+
+        # Pass 2: weighted accumulation of partial outputs
+        out     = tl.zeros((GROUP_SIZE, BLOCK_SIZE_D), dtype=tl.float32)
+        exp_sum = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
+
+        for split_idx in tl.static_range(KV_SPLIT_PARTS):
+            ws_task_idx = (b_id * NUM_KV_HEADS + kv_head_id) * KV_SPLIT_PARTS + split_idx
+
+            lse_ptrs = (
+                lse_ws_ptr
+                + ws_task_idx * stride_lse_task
+                + g_offsets * stride_lse_g
+            )
+            lse = tl.load(lse_ptrs)
+            w   = tl.math.exp(lse - lse_max)  # [G,]; 0 for empty splits (lse=-inf)
+            exp_sum += w
+
+            acc_ptrs = (
+                acc_ws_ptr
+                + ws_task_idx * stride_aws_task
+                + g_offsets[:, None] * stride_aws_g
+                + offs_d[None, :] * stride_aws_d
+            )
+            acc_split = tl.load(acc_ptrs, mask=offs_d[None, :] < HEAD_DIM, other=0.0)
+            out += w[:, None] * acc_split
+
+        # Normalise and write final output
+        exp_sum_safe = tl.where(exp_sum > 0, exp_sum, 1.0)
+        out = out / exp_sum_safe[:, None]
+
+        o_ptrs = (
+            o_ptr
+            + b_id * stride_ob
+            + q_head_ids[:, None] * stride_oh
+            + offs_d[None, :] * stride_od
+        )
+        tl.store(o_ptrs, out.to(o_ptr.dtype.element_ty), mask=offs_d[None, :] < HEAD_DIM)
+
+
 @triton.jit
 def paged_decode_kernel(
     q_ptr,
@@ -802,7 +1137,6 @@ def paged_attention_decode_impl(
 ) -> torch.Tensor:
     batch_size, num_q_heads, head_dim = q.shape
     num_total_blocks, num_kv_heads, page_size, head_dim_cache = key_cache.shape
-
     max_num_blocks_per_seq = block_tables.shape[1]
 
     assert head_dim == head_dim_cache
@@ -811,12 +1145,71 @@ def paged_attention_decode_impl(
 
     o = torch.empty_like(q)
 
-    cube_num = get_num_cores("cube")
-    grid = (cube_num,)
+    cube_num    = get_num_cores("cube")
+    vector_num  = get_num_cores("vector")
     BLOCK_SIZE_D = triton.next_power_of_2(head_dim)
     BLOCK_SIZE_N = min(128, triton.next_power_of_2(page_size))
+    group_size   = num_q_heads // num_kv_heads
+    max_kv_len   = int(seqlens.max().item())
 
-    paged_decode_kernel[grid](
+    if _should_use_flash_decode(batch_size, num_kv_heads, group_size, max_kv_len, cube_num):
+        kv_split_parts = _compute_kv_split_parts(
+            batch_size, num_kv_heads, max_kv_len, cube_num
+        )
+
+        # Workspace: one slot per (batch, kv_head, split)
+        num_ws_tasks = batch_size * num_kv_heads * kv_split_parts
+        acc_ws = torch.empty(
+            (num_ws_tasks, group_size, head_dim),
+            dtype=torch.float32, device=q.device,
+        )
+        lse_ws = torch.full(
+            (num_ws_tasks, group_size),
+            float("-inf"), dtype=torch.float32, device=q.device,
+        )
+
+        # Phase 1 – Cube cores: partial attention per (b, kv_head, split)
+        paged_decode_fd_kernel[(cube_num,)](
+            q, key_cache, value_cache, seqlens, block_tables,
+            acc_ws, lse_ws,
+            q.stride(0), q.stride(1), q.stride(2),
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3),
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
+            block_tables.stride(0), block_tables.stride(1),
+            acc_ws.stride(0), acc_ws.stride(1), acc_ws.stride(2),
+            lse_ws.stride(0), lse_ws.stride(1),
+            softmax_scale,
+            batch_size,
+            KV_SPLIT_PARTS=kv_split_parts,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            GQA_INTERLEAVE=gqa_interleave,
+            HEAD_DIM=head_dim,
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+        )
+
+        # Phase 2 – Vector cores: online-softmax merge across splits
+        paged_decode_fd_reduce_kernel[(vector_num,)](
+            acc_ws, lse_ws, o, seqlens,
+            acc_ws.stride(0), acc_ws.stride(1), acc_ws.stride(2),
+            lse_ws.stride(0), lse_ws.stride(1),
+            o.stride(0), o.stride(1), o.stride(2),
+            batch_size,
+            KV_SPLIT_PARTS=kv_split_parts,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            GQA_INTERLEAVE=gqa_interleave,
+            HEAD_DIM=head_dim,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+        )
+        return o
+
+    # -----------------------------------------------------------------------
+    # Non-FD path: original single-kernel decode
+    # -----------------------------------------------------------------------
+    paged_decode_kernel[(cube_num,)](
         q,
         key_cache,
         value_cache,
