@@ -334,8 +334,8 @@ test_configs_prefill = [
     (2, 8, 1, 128, 1024, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
     (2, 8, 1, 128, 0, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
 
-     (2, 8, 1, 128, 16384, 0, 128, torch.bfloat16, "M_BF16_WITH_CACHE_16384"),
-     (2, 8, 1, 128, 32768, 0, 128, torch.bfloat16, "M_BF16_WITH_CACHE_32768"),
+     (2, 8, 1, 128, 16384, 8192, 128, torch.bfloat16, "M_BF16_WITH_CACHE_16384"),
+     (2, 8, 1, 128, 32768, 10240, 128, torch.bfloat16, "M_BF16_WITH_CACHE_32768"),
 ]
 @pytest.mark.parametrize(
     "query, k_cache, v_cache, cu_q_lens, block_tables, cu_total_seq_lens",
