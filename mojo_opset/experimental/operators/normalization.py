@@ -178,8 +178,8 @@ class MojoGroupRMSNormInplace(MojoOperator):
         else:
             return output_groups
 
-    def extra_expr(self) -> str:
-        return f"{self.num_groups=}, {self.norm_size=}, {self.variance_epsilon=} {self.elementwise_affine=}".replace("self.", "")
+    def extra_repr(self) -> str:
+        return f"{self.num_groups=}, {self.norm_size=}, {self.variance_epsilon=}, {self.elementwise_affine=}".replace("self.", "")
 
 __all__ = [
     "MojoGroupLayerNorm",
