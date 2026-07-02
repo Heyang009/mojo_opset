@@ -189,4 +189,130 @@ class MojoStorePagedKVCacheC8(MojoOperator):
 __all__ = [
     "MojoStorePagedMLAKVCache",
     "MojoStorePagedKVCacheC8",
+    "MojoQuantQKVAndStoreKVCache",
 ]
+
+
+class MojoQuantQKVAndStoreKVCache(MojoOperator):
+    """Quantize Q/K/V and store quantized K/V into paged KV cache (C8).
+
+    与 ``MojoStorePagedKVCacheC8`` 不同的是：
+      - Q 在算子内做 per-token-per-head 动态量化（输出 int8 query + per-token-per-head scale）；
+      - K 同样做 per-token-per-head 动态量化，并写入 paged key cache；
+      - V 用外部传入的 per-channel 静态 scale 量化，并写入 paged value cache。
+
+    Forward signature 对齐 ``xpu_ops.modules.QuantQKVAndStoreKVCache``，便于 xops 后端薄封装；
+    参考实现走纯 torch，主要服务于精度对比。
+
+    Args:
+        block_size (int): paged cache 的 block_size，与 cache 第 3 维一致。
+        slot_mapping_path (bool): 是否走 slot_mapping 直接写 paged cache（True 表示 forward
+            必传 slot_mapping）。当前 ILU 默认 True。
+    """
+
+    def __init__(self, *, block_size: Optional[int] = None, **kwargs):
+        super().__init__(**kwargs)
+        # block_size 留作可选 hint；实际 forward 也可以从 cache.shape[2] 读出。
+        self.block_size = block_size
+
+    def extra_repr(self) -> str:
+        return f"block_size={self.block_size}"
+
+    @staticmethod
+    def _per_token_per_head_quant_int8(
+        x: torch.Tensor,  # [T, H, D]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_fp = x.to(torch.float32)
+        amax = x_fp.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [T, H, 1]
+        scale = (amax / 127.0).squeeze(-1)  # [T, H]
+        out = torch.round(x_fp / scale.unsqueeze(-1)).clamp(-128, 127).to(torch.int8)
+        # xpu_ops 返回 query scale 形状是 [H, T]（per-head 行向量），与 [T, H] 转置后等价。
+        return out, scale.transpose(0, 1).contiguous()
+
+    @staticmethod
+    def _per_channel_quant_int8(
+        x: torch.Tensor,         # [T, H, D]
+        scale: torch.Tensor,     # [H, D]
+    ) -> torch.Tensor:
+        return torch.round(x.to(torch.float32) / scale).clamp(-128, 127).to(torch.int8)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        value_scale: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: Optional[torch.Tensor] = None,
+        cumsum_query_len: Optional[torch.Tensor] = None,
+        kv_len: Optional[torch.Tensor] = None,
+        kv_ids: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        # 与 xpu_ops 接口保持兼容的 placeholder，参考实现仅用 slot_mapping
+        key_scale_cache: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Run quant + paged store reference impl.
+
+        Args:
+            query / key / value: ``(T, *_heads, head_dim)`` 浮点输入。
+            value_scale: ``(kv_heads, head_dim)`` per-channel value 量化 scale (fp32)。
+            key_cache: ``(num_blocks, kv_heads, block_size, head_dim)``，dtype int8。
+            value_cache: 形状 dtype 同 key_cache。
+            slot_mapping: ``(T,)`` int32，每个 token 的全局 cache offset。
+            cumsum_query_len / kv_len / kv_ids / block_table: 与 xpu_ops 接口对齐，参考实现不消费。
+            key_scale_cache: 与 xpu_ops 接口兼容的 K scale cache（per-token-per-head），
+                参考实现不读不写，只透传 None 用于对齐返回值数量。
+
+        Returns:
+            (output_quant_query, output_query_scale, key_cache, key_scale_cache,
+             value_cache, value_scale_cache)。
+            - output_quant_query: int8 ``(T, q_heads, head_dim)``
+            - output_query_scale: fp32 ``(T, q_heads)``
+            - key_cache, value_cache: 原 cache（已 inplace 改写）
+            - key_scale_cache: 透传输入（可能为 None）
+            - value_scale_cache: 始终 None（per-channel scale 是输入，不是输出）
+        """
+        del cumsum_query_len, kv_len, kv_ids, block_table  # 接口对齐占位
+
+        assert query.dim() == 3 and key.dim() == 3 and value.dim() == 3, (
+            "query/key/value must be 3D packed [T, N, D]."
+        )
+        assert key.shape == value.shape, "key/value shape must match."
+        assert key_cache.shape == value_cache.shape, "key/value cache shape must match."
+        assert key_cache.dim() == 4, "cache must be (num_blocks, kv_heads, block_size, head_dim)."
+        assert value_scale is not None, "value_scale (per-channel) is required."
+        assert slot_mapping is not None, "slot_mapping is required (paged write path)."
+        assert slot_mapping.dim() == 1 and slot_mapping.shape[0] == key.shape[0]
+
+        # 1. Q 量化（per-token-per-head）
+        q_quant, q_scale = self._per_token_per_head_quant_int8(query)
+
+        # 2. K 量化（per-token-per-head），用于写 paged key cache
+        k_quant, k_scale = self._per_token_per_head_quant_int8(key)
+
+        # 3. V 量化（per-channel，scale 是输入）
+        v_quant = self._per_channel_quant_int8(value, value_scale)
+
+        # 4. paged write
+        block_size = key_cache.shape[2]
+        if key_scale_cache is None:
+            num_blocks = key_cache.shape[0]
+            kv_heads = key_cache.shape[1]
+            key_scale_cache = torch.zeros(
+                (num_blocks, kv_heads, block_size),
+                dtype=torch.float32,
+                device=key_cache.device,
+            )
+        # k_scale 形状 [H, T]，按 slot 写入 [num_blocks, H, block_size]
+        for src_idx, slot in enumerate(slot_mapping.tolist()):
+            slot = int(slot)
+            if slot < 0:
+                continue
+            blk = slot // block_size
+            off = slot % block_size
+            key_cache[blk, :, off, :] = k_quant[src_idx]
+            value_cache[blk, :, off, :] = v_quant[src_idx]
+            key_scale_cache[blk, :, off] = k_scale[:, src_idx]
+
+        return q_quant, q_scale, key_cache, key_scale_cache, value_cache, None

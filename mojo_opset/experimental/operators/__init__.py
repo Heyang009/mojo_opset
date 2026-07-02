@@ -19,6 +19,7 @@ from .gemm import MojoQuantBatchGemmReduceSum
 from .indexer import MojoIndexer
 from .indexer import MojoLightningIndexer
 from .kv_cache import MojoStorePagedMLAKVCache
+from .kv_cache import MojoQuantQKVAndStoreKVCache
 from .moe import MojoMixLinear
 from .moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .moe import MojoMoEInitRoutingDynamicQuant
@@ -28,6 +29,7 @@ from .position_embedding import MojoGridRoPE
 from .position_embedding import MojoMRoPEInplace
 from .position_embedding import MojoRelativeEmbedding
 from .position_embedding import MojoRotaryEmbedding
+from .position_embedding import MojoFusedRMSNormRope
 from .fused_norm_rope_quant_store import MojoFusedNormRoPEQuantStore
 from .store_lowrank import MojoStoreLowrank
 
@@ -52,6 +54,7 @@ __all__ = [
     "MojoPagedPrefillSWAWithKVDequant",
     "MojoPagedDecodeSWAWithKVDequant",
     "MojoStorePagedMLAKVCache",
+    "MojoQuantQKVAndStoreKVCache",
     "MojoMixLinear",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
@@ -64,4 +67,5 @@ __all__ = [
     "MojoStoreLowrank",
     "MojoQuantBatchGemmReduceSum",
     "MojoFusedNormRoPEQuantStore",
+    "MojoFusedRMSNormRope",
 ]

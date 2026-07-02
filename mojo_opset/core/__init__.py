@@ -39,6 +39,7 @@ from .operators.compute_with_comm import MojoGemmAllReduce
 from .operators.compute_with_comm import MojoGemmReduceScatter
 from .operators.compute_with_comm import MojoAllGatherQuantGemm
 from .operators.compute_with_comm import MojoQuantGemmReduceScatter
+from .operators.compute_with_comm import MojoAll2AllQuantGemm
 
 """ embedding """
 from .operators.embedding import MojoEmbedding
@@ -135,6 +136,7 @@ __all__ = [
     "MojoGemmReduceScatter",
     "MojoAllGatherQuantGemm",
     "MojoQuantGemmReduceScatter",
+    "MojoAll2AllQuantGemm",
 
     "MojoStaticQuant",
     "MojoDequant",

@@ -441,6 +441,152 @@ class MojoAllGatherQuantGemm(MojoOperator):
         )
 
 
+class MojoAll2AllQuantGemm(MojoOperator):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        output_dtype: torch.dtype = torch.bfloat16,
+        trans_weight: bool = False,
+        quant_dtype: torch.dtype = torch.int8,
+        process_group: Optional[dist.ProcessGroup] = None,
+        scatter_dim: int = 0,
+        gather_dim: int = 1,
+        **kwargs,
+    ):
+        """SP-fused AllToAll + quantized (int8) GEMM.
+
+        Each rank holds the full token batch in int8 with a *channel shard*
+        along ``gather_dim`` (i.e. the K dim) and a synchronised per-token
+        scale of length ``M`` (the same scale on every rank — caller is
+        responsible for the cross-rank scale sync, e.g. by doing a per-token
+        amax + AllGather of the scale before invoking this op).
+
+        AllToAll then *swaps* the sharded axis: after the call each rank holds
+        a token shard along ``scatter_dim`` of size ``M/world_size`` with the
+        full K reassembled. The int8 @ int8 GEMM with the per-channel weight
+        scale produces the bf16 output. Typical use: smooth-quant attention
+        output projection where the input channel split mirrors the head
+        partition and the o_proj weight is unsharded along K.
+
+        Semantics::
+
+            # input:       int8 [M, K/world]
+            # input_scale: fp32 [M]          (synchronised across ranks)
+            # weight:      int8 [K, N]       (unsharded along K)
+            # weight_scale fp32 [N]
+            x_full     = all_to_all(input,
+                                    scatter_dim=scatter_dim,   # split M
+                                    gather_dim=gather_dim)     # cat K
+            scale_local = input_scale.chunk(world, dim=0)[rank]
+            output      = quant_gemm(x_full, scale_local,
+                                     weight, weight_scale)     # output_dtype
+
+        When ``torch.distributed`` is not initialised, AllToAll is identity
+        and the op degrades to a plain quantized GEMM.
+
+        Args:
+            in_features (int): Logical K dim of the int8 weight, i.e. the full
+                K = ``input.shape[-1] * world_size``.
+            out_features (int): Logical N dim of the int8 weight and weight_scale.
+            output_dtype (torch.dtype): Dequantized output dtype (default bf16).
+            trans_weight (bool): If True the weight is stored as (N, K).
+            quant_dtype (torch.dtype): Quantized dtype, only ``int8`` supported.
+            process_group (Optional[ProcessGroup]): TP group for AllToAll.
+            scatter_dim (int): Token (M) dim to scatter along after A2A. Default 0.
+            gather_dim (int): Channel (K) dim that becomes contiguous after A2A.
+                Default 1.
+            **kwargs: Tensor factory kwargs forwarded to the weight buffers.
+        """
+        super().__init__(**kwargs)
+        if quant_dtype != torch.int8:
+            raise NotImplementedError(
+                f"Unsupported quant_dtype: {quant_dtype}, expected torch.int8."
+            )
+        if not isinstance(trans_weight, bool):
+            raise TypeError("trans_weight must be bool.")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_shape = (out_features, in_features) if trans_weight else (in_features, out_features)
+        weight_factory_kwargs = {**self.tensor_factory_kwargs, "dtype": quant_dtype}
+        weight_scale_factory_kwargs = {**self.tensor_factory_kwargs, "dtype": torch.bfloat16}
+        self.quant_dtype = quant_dtype
+        self.output_dtype = output_dtype
+        self.trans_weight = trans_weight
+        self.process_group = process_group
+        self.scatter_dim = scatter_dim
+        self.gather_dim = gather_dim
+        self.register_buffer("weight", torch.empty(self.weight_shape, **weight_factory_kwargs))
+        self.register_buffer("weight_scale", torch.empty(out_features, **weight_scale_factory_kwargs))
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        input_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            input (torch.Tensor): int8 ``(M, K/world)`` — channel-shard of the
+                quantized activation, full token batch on this rank.
+            input_scale (torch.Tensor): fp32 ``(M,)`` — per-token scale,
+                already synchronised across ranks (same tensor on every rank).
+
+        Returns:
+            torch.Tensor: ``output_dtype`` ``(M/world_size, out_features)``
+                after AllToAll (split M, gather K) and the quantized GEMM.
+                Single-rank fallback returns the full unscattered output.
+        """
+        if input.dim() != 2:
+            raise ValueError(f"input must be 2D, got shape {tuple(input.shape)}.")
+        if _is_dist_initialized():
+            pg = self.process_group or _get_default_group()
+            world_size = dist.get_world_size(group=pg)
+            rank = dist.get_rank(group=pg)
+            M = input.shape[0]
+            K_local = input.shape[-1]
+            if M % world_size != 0:
+                raise ValueError(
+                    f"M {M} must be divisible by world_size {world_size}"
+                )
+            K = K_local * world_size
+            if K != self.in_features:
+                raise ValueError(
+                    f"K_global {K} (= K_local * world_size) must match in_features {self.in_features}."
+                )
+            m_per_rank = M // world_size
+            # Reference layout matches xpu_ops.All2AllQuantMatmul reference:
+            #   buf[r, m, k] = input[r * m_per_rank : (r + 1) * m_per_rank, :] viewed across ranks
+            # After all_to_all_single + permute(1, 0, 2) -> reshape(m_per_rank, K).
+            send = input.contiguous().view(world_size, m_per_rank, K_local)
+            recv = torch.empty_like(send)
+            dist.all_to_all_single(recv, send, group=pg)
+            x_full = recv.permute(1, 0, 2).contiguous().reshape(m_per_rank, K)
+            scale_local = input_scale.reshape(-1)[
+                rank * m_per_rank : (rank + 1) * m_per_rank
+            ].contiguous()
+            return _quant_gemm(
+                x_full, scale_local, self.weight, self.weight_scale,
+                self.trans_weight, self.output_dtype,
+            )
+        if input.shape[-1] != self.in_features:
+            raise ValueError(
+                f"input K {input.shape[-1]} must match in_features {self.in_features} "
+                f"(single-rank fallback path)."
+            )
+        return _quant_gemm(
+            input, input_scale, self.weight, self.weight_scale,
+            self.trans_weight, self.output_dtype,
+        )
+
+    def extra_repr(self) -> str:
+        weight_shape = tuple(self.weight.shape) if isinstance(self.weight, torch.Tensor) else None
+        return (
+            f"{weight_shape=}, in={self.in_features}, out={self.out_features}, "
+            f"trans_weight={self.trans_weight}, "
+            f"scatter_dim={self.scatter_dim}, gather_dim={self.gather_dim}"
+        )
+
+
 class MojoQuantGemmReduceScatter(MojoOperator):
     def __init__(
         self,

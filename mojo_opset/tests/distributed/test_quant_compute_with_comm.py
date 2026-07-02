@@ -20,6 +20,7 @@ import torch.multiprocessing as mp
 
 from mojo_opset import MojoAllGatherQuantGemm
 from mojo_opset import MojoQuantGemmReduceScatter
+from mojo_opset import MojoAll2AllQuantGemm
 from mojo_opset.tests.utils import bypass_not_implemented
 from mojo_opset.utils.platform import get_dist_backend, get_platform, get_torch_device
 
@@ -422,3 +423,166 @@ def test_quant_gemm_reduce_scatter_no_dist(in_features, out_features, trans_weig
     x = _to_dev(torch.randint(-128, 127, (seq, in_features), dtype=torch.int8))
     scale = _to_dev(torch.rand(seq, dtype=torch.float32) + 0.1)
     op.forward_diff_with(op_ref, x, scale, atol=1, rtol=2e-3)
+
+
+# ===========================================================================
+# All2AllQuantGemm — multi-rank
+# ===========================================================================
+
+# (M, in_features, out_features) for All2All + QuantGemm.
+# M and in_features divisible by WORLD_SIZE; in_features is K_GLOBAL because
+# the unsharded weight is [K_global, N]. Caller-side input is K-sharded
+# [M, K_global / world_size]. Per-token scale is the synchronised full M.
+_A2A_SHAPES = [
+    (8, 16, 32),                # tiny smoke
+    (32, 256, 512),             # small
+    (128, 1024, 2048),          # medium
+    (4096, 4096, 3584),         # M13 prefill Out proj: K_global=4096 → H=3584
+    (4096, 3072, 3584),         # GQA Out proj
+    (4096, 8192, 3584),         # SWA Out proj
+    (1, 4096, 3584),            # decode batch=1 (M=1 wont divide by world>1, will skip)
+    (128, 4096, 3584),          # small batch
+]
+
+
+def _worker_a2a(rank, world_size, port, shape, trans_weight, non_contig):
+    _init_pg(rank, world_size, port)
+    try:
+        m_full, in_features, out_features = shape
+
+        weight_shape = (
+            (out_features, in_features) if trans_weight else (in_features, out_features)
+        )
+        weight_int8 = torch.randint(-128, 127, weight_shape, dtype=torch.int8)
+        weight_scale = torch.rand(out_features, dtype=torch.bfloat16) + 0.5
+
+        op = MojoAll2AllQuantGemm(
+            in_features=in_features,
+            out_features=out_features,
+            trans_weight=trans_weight,
+            process_group=dist.group.WORLD,
+            scatter_dim=0,
+            gather_dim=1,
+        )
+        op = op.to(DEVICE) if DEVICE != "cpu" else op
+        state = {
+            "weight": _to_dev(weight_int8),
+            "weight_scale": _to_dev(weight_scale),
+        }
+        op.load_state_dict(state)
+
+        k_local = in_features // world_size
+        if non_contig:
+            big = torch.randint(-128, 127, (m_full, k_local * 2), dtype=torch.int8)
+            x_local = _to_dev(big)[:, ::2]
+            assert not x_local.is_contiguous()
+        else:
+            x_local = _to_dev(
+                torch.randint(-128, 127, (m_full, k_local), dtype=torch.int8)
+            )
+        # Caller contract: per-token scale is already cross-rank synchronised.
+        # Broadcast from rank 0 to mimic that.
+        scale_full = torch.rand(m_full, dtype=torch.float32) + 0.1
+        scale_full = _to_dev(scale_full)
+        dist.broadcast(scale_full, src=0)
+
+        actual = op(x_local, scale_full)
+
+        # Reference (mirrors xpu_ops.reference_all2all_quant_matmul):
+        # gather x_local across ranks along K to reconstruct full K, then take
+        # this rank's M-shard and quant_gemm against the unsharded weight.
+        m_per_rank = m_full // world_size
+        x_local_c = x_local.contiguous()
+        recv_buf = torch.empty(
+            (world_size, m_per_rank, k_local),
+            dtype=x_local.dtype, device=x_local.device,
+        )
+        send_buf = x_local_c.view(world_size, m_per_rank, k_local).contiguous()
+        dist.all_to_all_single(recv_buf, send_buf, group=dist.group.WORLD)
+        x_full = recv_buf.permute(1, 0, 2).contiguous().reshape(m_per_rank, in_features)
+        scale_local_ref = scale_full[rank * m_per_rank : (rank + 1) * m_per_rank].contiguous()
+        w_dev = _to_dev(weight_int8)
+        if trans_weight:
+            ref = x_full.float() @ w_dev.float().T
+        else:
+            ref = x_full.float() @ w_dev.float()
+        ref = ref * scale_local_ref.float().unsqueeze(-1) * _to_dev(weight_scale).float()
+        expected = ref.to(torch.bfloat16)
+
+        torch.testing.assert_close(
+            actual.to(torch.float32),
+            expected.to(torch.float32),
+            atol=1, rtol=2e-3,
+        )
+    finally:
+        if dist.is_initialized():
+            _destroy_pg()
+
+
+@pytest.mark.parametrize("shape", _A2A_SHAPES)
+@pytest.mark.parametrize("trans_weight", [False, True])
+@bypass_not_implemented
+def test_all2all_quant_gemm_comm(master_port, shape, trans_weight):
+    m_full, in_features, _ = shape
+    if m_full % WORLD_SIZE != 0:
+        pytest.skip(f"m_full={m_full} not divisible by world_size={WORLD_SIZE}")
+    if in_features % WORLD_SIZE != 0:
+        pytest.skip(f"in_features={in_features} not divisible by world_size={WORLD_SIZE}")
+
+    mp.spawn(
+        _worker_a2a,
+        args=(WORLD_SIZE, master_port, shape, trans_weight, False),
+        nprocs=WORLD_SIZE,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "in_features, out_features",
+    [(64, 128), (1024, 2048), (4096, 3584)],
+)
+@pytest.mark.parametrize("trans_weight", [False, True])
+@bypass_not_implemented
+def test_all2all_quant_gemm_no_dist(in_features, out_features, trans_weight):
+    """Single-rank fallback: AllToAll degenerates to identity, op behaves as
+    a plain quantized GEMM. Compares xops-style forward against a hand-written
+    int8 GEMM reference (no backend registry dispatch needed)."""
+    seq = 32
+    weight_shape = (
+        (out_features, in_features) if trans_weight else (in_features, out_features)
+    )
+    weight_int8 = torch.randint(-128, 127, weight_shape, dtype=torch.int8)
+    weight_scale = torch.rand(out_features, dtype=torch.bfloat16) + 0.5
+
+    op = MojoAll2AllQuantGemm(
+        in_features=in_features, out_features=out_features,
+        trans_weight=trans_weight, process_group=None,
+        scatter_dim=0, gather_dim=1,
+    )
+    op = op.to(DEVICE) if DEVICE != "cpu" else op
+    state = {
+        "weight": _to_dev(weight_int8),
+        "weight_scale": _to_dev(weight_scale),
+    }
+    op.load_state_dict(state)
+
+    x = _to_dev(torch.randint(-128, 127, (seq, in_features), dtype=torch.int8))
+    scale = _to_dev(torch.rand(seq, dtype=torch.float32) + 0.1)
+    actual = op(x, scale)
+
+    # Reference: plain int8 @ int8 emulated in fp32, mirroring _quant_gemm.
+    w = weight_int8 if trans_weight else weight_int8
+    w_dev = _to_dev(w)
+    if trans_weight:
+        ref = x.float() @ w_dev.float().T
+    else:
+        ref = x.float() @ w_dev.float()
+    ref = ref * scale.float().unsqueeze(-1) * _to_dev(weight_scale).float()
+    ref = ref.to(torch.bfloat16)
+
+    torch.testing.assert_close(
+        actual.to(torch.float32),
+        ref.to(torch.float32),
+        atol=1, rtol=2e-3,
+    )
+

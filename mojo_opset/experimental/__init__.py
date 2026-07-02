@@ -30,6 +30,7 @@ from .operators.indexer import MojoIndexer
 from .operators.indexer import MojoLightningIndexer
 from .operators.kv_cache import MojoStorePagedKVCacheC8
 from .operators.kv_cache import MojoStorePagedMLAKVCache
+from .operators.kv_cache import MojoQuantQKVAndStoreKVCache
 from .operators.moe import MojoMixLinear
 from .operators.moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .operators.moe import MojoMoEInitRoutingDynamicQuant
@@ -41,6 +42,7 @@ from .operators.position_embedding import MojoGridRoPE
 from .operators.position_embedding import MojoMRoPEInplace
 from .operators.position_embedding import MojoRelativeEmbedding
 from .operators.position_embedding import MojoRotaryEmbedding
+from .operators.position_embedding import MojoFusedRMSNormRope
 from .operators.fused_norm_rope_quant_store import MojoFusedNormRoPEQuantStore
 from .operators.store_lowrank import MojoStoreLowrank
 
@@ -71,6 +73,7 @@ __all__ = [
     "MojoPagedPrefillSageGQA",
     "MojoStorePagedKVCacheC8",
     "MojoStorePagedMLAKVCache",
+    "MojoQuantQKVAndStoreKVCache",
     "MojoMixLinear",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
@@ -84,5 +87,6 @@ __all__ = [
     "MojoRotaryEmbedding",
     "MojoStoreLowrank",
     "MojoFusedNormRoPEQuantStore",
+    "MojoFusedRMSNormRope",
     "MojoIndexer",
 ]
