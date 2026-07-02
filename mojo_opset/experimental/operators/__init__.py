@@ -21,6 +21,7 @@ from .indexer import MojoLightningIndexer
 from .kv_cache import MojoStorePagedMLAKVCache
 from .kv_cache import MojoQuantQKVAndStoreKVCache
 from .moe import MojoMixLinear
+from .moe import MojoQuantMoEPreQuant
 from .moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .moe import MojoMoEInitRoutingDynamicQuant
 from .normalization import MojoChannelRMSNorm
@@ -56,6 +57,7 @@ __all__ = [
     "MojoStorePagedMLAKVCache",
     "MojoQuantQKVAndStoreKVCache",
     "MojoMixLinear",
+    "MojoQuantMoEPreQuant",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
     "MojoGroupLayerNorm",

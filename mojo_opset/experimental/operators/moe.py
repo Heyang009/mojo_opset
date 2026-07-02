@@ -1,4 +1,5 @@
 from typing import Optional
+from typing import Union
 
 import torch
 import torch.nn.functional as F
@@ -6,6 +7,10 @@ from torch import nn
 
 from mojo_opset.core.operator import MojoOperator
 from mojo_opset.core.operators.moe import _count_expert_tokens
+from mojo_opset.core.operators.moe import MojoMoECombine
+from mojo_opset.core.operators.moe import MojoMoEDispatch
+from mojo_opset.core.operators.moe import MojoMoEGating
+from mojo_opset.core.operators.moe import MojoQuantExperts
 
 
 def _validate_moe_token_count(token_count: torch.Tensor, route_count: int) -> torch.Tensor:
@@ -123,6 +128,266 @@ class MojoMixLinear(MojoOperator):
         return f"in_features={self.in_features}, out_features={self.out_features}"
 
 
+def _prequant_scale_2d(scale: torch.Tensor, token_num: int) -> torch.Tensor:
+    if scale.dim() == 1:
+        scale_2d = scale.reshape(-1, 1)
+    elif scale.dim() == 2 and scale.size(1) == 1:
+        scale_2d = scale
+    else:
+        raise ValueError(f"scale must have shape [tokens] or [tokens, 1], got {tuple(scale.shape)}.")
+    if scale_2d.size(0) != token_num:
+        raise ValueError(f"scale first dim must match token_num={token_num}, got {scale_2d.size(0)}.")
+    return scale_2d.float()
+
+
+class MojoQuantMoEPreQuant(MojoOperator):
+    def __init__(
+        self,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size=None,
+        activation: str = "swiglu",
+        quant_dtype: torch.dtype = torch.int8,
+        up_quant_group_size: int = -1,
+        up_weight_dtype: Union[torch.dtype, str] = torch.int8,
+        down_quant_group_size: int = -1,
+        down_weight_dtype: Union[torch.dtype, str] = torch.int8,
+        output_dtype: torch.dtype = torch.bfloat16,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        ep_group=None,
+        dp_input: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if activation != "swiglu":
+            raise NotImplementedError(f"MojoQuantMoEPreQuant: Activation {activation} is not supported.")
+        if quant_dtype != torch.int8:
+            raise NotImplementedError(f"MojoQuantMoEPreQuant: quant_dtype must be 'int8', got {quant_dtype}.")
+        if up_weight_dtype not in ("int4", torch.int8) or down_weight_dtype not in ("int4", torch.int8):
+            raise ValueError("MojoQuantMoEPreQuant: weight must be w4 or w8")
+        if intermediate_size is None:
+            raise ValueError("MojoQuantMoEPreQuant: intermediate_size must be provided.")
+
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.quant_dtype = quant_dtype
+        self.up_quant_group_size = up_quant_group_size
+        self.up_weight_dtype = up_weight_dtype
+        self.down_quant_group_size = down_quant_group_size
+        self.down_weight_dtype = down_weight_dtype
+        self.output_dtype = output_dtype
+
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.ep_group = ep_group
+        base = num_experts // ep_size
+        rem = num_experts % ep_size
+        self.num_experts_local = base + 1 if ep_rank < rem else base
+        self.ep_start = base * ep_rank + min(ep_rank, rem)
+        self.ep_end = self.ep_start + self.num_experts_local
+        self.dp_input = dp_input
+
+        self.gating = MojoMoEGating._registry.get("torch")(
+            hidden_size=self.hidden_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            **kwargs,
+        )
+        self.dispatch = MojoMoEDispatch._registry.get("torch")(num_experts=self.num_experts, **kwargs)
+        self.experts = MojoQuantExperts._registry.get("torch")(
+            num_experts=self.num_experts_local,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            activation=activation,
+            quant_dtype=quant_dtype,
+            up_quant_group_size=up_quant_group_size,
+            up_weight_dtype=up_weight_dtype,
+            down_quant_group_size=down_quant_group_size,
+            down_weight_dtype=down_weight_dtype,
+            **kwargs,
+        )
+        self.combine = MojoMoECombine._registry.get("torch")(multiply_by_gates=True, **kwargs)
+
+    def _prequant_experts(
+        self,
+        sorted_hidden_states: torch.Tensor,
+        sorted_scale: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens_per_expert_list = tokens_per_expert.to("cpu").tolist()
+        x_int8_list = torch.split(sorted_hidden_states, tokens_per_expert_list, dim=0)
+        x_scale_list = torch.split(sorted_scale, tokens_per_expert_list, dim=0)
+
+        activated_outs = []
+        for expert_idx, token_count in enumerate(tokens_per_expert_list):
+            if token_count == 0:
+                activated_outs.append(
+                    torch.empty(
+                        0,
+                        self.intermediate_size,
+                        device=sorted_hidden_states.device,
+                        dtype=self.output_dtype,
+                    )
+                )
+                continue
+
+            fc1_out = self.experts._quant_linear(
+                x_int8_list[expert_idx],
+                x_scale_list[expert_idx],
+                self.experts.up_proj_weight[expert_idx],
+                self.experts.up_proj_weight_scale[expert_idx],
+                self.output_dtype,
+                self.up_weight_dtype,
+                self.up_quant_group_size,
+            )
+            gate_proj, up_proj = fc1_out.float().chunk(2, dim=-1)
+            activated_outs.append((F.silu(gate_proj) * up_proj).to(self.output_dtype))
+        activated = torch.cat(activated_outs, dim=0)
+
+        y_int8, y_scale = self.experts.down_proj_quantize(activated, tokens_per_expert)
+        y_int8_list = torch.split(y_int8, tokens_per_expert_list, dim=0)
+        y_scale_list = torch.split(y_scale, tokens_per_expert_list, dim=0)
+        outputs = []
+        for expert_idx, token_count in enumerate(tokens_per_expert_list):
+            if token_count == 0:
+                outputs.append(
+                    torch.empty(
+                        0,
+                        self.hidden_size,
+                        device=sorted_hidden_states.device,
+                        dtype=self.output_dtype,
+                    )
+                )
+                continue
+
+            fc2_out = self.experts._quant_linear(
+                y_int8_list[expert_idx],
+                y_scale_list[expert_idx],
+                self.experts.down_proj_weight[expert_idx],
+                self.experts.down_proj_weight_scale[expert_idx],
+                self.output_dtype,
+                self.down_weight_dtype,
+                self.down_quant_group_size,
+            )
+            outputs.append(fc2_out)
+
+        return torch.cat(outputs, dim=0)
+
+    def forward(
+        self,
+        quant_hidden_states: torch.Tensor,
+        scale: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        if quant_hidden_states.dtype != torch.int8:
+            raise TypeError(
+                f"quant_hidden_states must be pre-quantized torch.int8, got {quant_hidden_states.dtype}."
+            )
+        if quant_hidden_states.dim() != 2:
+            raise ValueError(f"quant_hidden_states must be 2D, got shape {tuple(quant_hidden_states.shape)}.")
+        if quant_hidden_states.size(1) != self.hidden_size:
+            raise ValueError(
+                f"quant_hidden_states last dim must be hidden_size={self.hidden_size}, "
+                f"got {quant_hidden_states.size(1)}."
+            )
+        if hidden_states.shape != quant_hidden_states.shape:
+            raise ValueError(
+                "hidden_states must have the same shape as quant_hidden_states, "
+                f"got {tuple(hidden_states.shape)} vs {tuple(quant_hidden_states.shape)}."
+            )
+
+        scale_2d = _prequant_scale_2d(scale, quant_hidden_states.size(0)).to(device=quant_hidden_states.device)
+
+        if self.dp_input and self.ep_size > 1:
+            local_tokens = quant_hidden_states.shape[0]
+            full_quant_hidden = torch.empty(
+                local_tokens * self.ep_size,
+                quant_hidden_states.shape[1],
+                dtype=quant_hidden_states.dtype,
+                device=quant_hidden_states.device,
+            )
+            full_scale = torch.empty(
+                local_tokens * self.ep_size,
+                scale_2d.shape[1],
+                dtype=scale_2d.dtype,
+                device=scale_2d.device,
+            )
+            full_gate_hidden = torch.empty(
+                local_tokens * self.ep_size,
+                hidden_states.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            import torch.distributed as dist
+
+            dist.all_gather_into_tensor(full_quant_hidden, quant_hidden_states.contiguous(), group=self.ep_group)
+            dist.all_gather_into_tensor(full_scale, scale_2d.contiguous(), group=self.ep_group)
+            dist.all_gather_into_tensor(full_gate_hidden, hidden_states.contiguous(), group=self.ep_group)
+            quant_hidden_states = full_quant_hidden
+            scale_2d = full_scale
+            hidden_states = full_gate_hidden
+
+        top_k_indices, top_k_gates = self.gating(hidden_states)
+        sorted_hidden_states, tokens_per_expert, sorted_gates, token_indices = self.dispatch(
+            quant_hidden_states,
+            top_k_gates,
+            top_k_indices,
+        )
+        sorted_scale = scale_2d.index_select(0, token_indices.to(dtype=torch.long))
+
+        if self.ep_size > 1:
+            cumsum = tokens_per_expert.cumsum(0)
+            tok_start = 0 if self.ep_start == 0 else cumsum[self.ep_start - 1].item()
+            tok_end = cumsum[self.ep_end - 1].item()
+            sorted_hidden_states = sorted_hidden_states[tok_start:tok_end]
+            sorted_scale = sorted_scale[tok_start:tok_end]
+            tokens_per_expert = tokens_per_expert[self.ep_start:self.ep_end]
+            sorted_gates = sorted_gates[tok_start:tok_end]
+            token_indices = token_indices[tok_start:tok_end]
+
+        expert_outputs = self._prequant_experts(sorted_hidden_states, sorted_scale, tokens_per_expert)
+        output_buffer = torch.zeros(
+            quant_hidden_states.size(0),
+            self.hidden_size,
+            dtype=self.output_dtype,
+            device=quant_hidden_states.device,
+        )
+        combined = self.combine(output_buffer, expert_outputs, sorted_gates, token_indices)
+
+        if self.ep_size > 1:
+            import torch.distributed as dist
+
+            if self.dp_input:
+                local_combined = torch.empty(
+                    combined.shape[0] // self.ep_size,
+                    combined.shape[1],
+                    dtype=combined.dtype,
+                    device=combined.device,
+                )
+                dist.reduce_scatter_tensor(
+                    local_combined,
+                    combined.contiguous(),
+                    op=dist.ReduceOp.SUM,
+                    group=self.ep_group,
+                )
+                combined = local_combined
+            else:
+                dist.all_reduce(combined, op=dist.ReduceOp.SUM, group=self.ep_group)
+
+        return combined
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_experts={self.num_experts}, top_k={self.top_k}, hidden_size={self.hidden_size}, "
+            f"intermediate_size={self.intermediate_size}, output_dtype={self.output_dtype}, "
+            f"up_weight_dtype={self.up_weight_dtype}, down_weight_dtype={self.down_weight_dtype}"
+        )
+
+
 class MojoMoEInitRoutingDynamicQuant(MojoOperator):
     def __init__(
         self,
@@ -228,6 +493,7 @@ class MojoFusedSwiGLUMoEScaleDynamicQuantize(MojoOperator):
 
 __all__ = [
     "MojoMixLinear",
+    "MojoQuantMoEPreQuant",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
 ]

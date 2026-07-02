@@ -32,6 +32,7 @@ from .operators.kv_cache import MojoStorePagedKVCacheC8
 from .operators.kv_cache import MojoStorePagedMLAKVCache
 from .operators.kv_cache import MojoQuantQKVAndStoreKVCache
 from .operators.moe import MojoMixLinear
+from .operators.moe import MojoQuantMoEPreQuant
 from .operators.moe import MojoFusedSwiGLUMoEScaleDynamicQuantize
 from .operators.moe import MojoMoEInitRoutingDynamicQuant
 from .operators.normalization import MojoChannelRMSNorm
@@ -75,6 +76,7 @@ __all__ = [
     "MojoStorePagedMLAKVCache",
     "MojoQuantQKVAndStoreKVCache",
     "MojoMixLinear",
+    "MojoQuantMoEPreQuant",
     "MojoMoEInitRoutingDynamicQuant",
     "MojoFusedSwiGLUMoEScaleDynamicQuantize",
     "MojoGroupLayerNorm",
