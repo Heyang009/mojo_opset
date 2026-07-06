@@ -189,6 +189,7 @@ def _rot_pos_embed_kernel(
         triton.Config({"TOKEN_BLOCK_SIZE": 32}),
     ],
     key=["n_qh", "n_kh"],
+    restore_value=["q_ptr", "k_ptr"],
 )
 @triton.jit(do_not_specialize=["seq_len"])
 def _rope_inplace_kernel(
