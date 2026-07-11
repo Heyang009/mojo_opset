@@ -9,6 +9,12 @@ from .utils import get_num_cores
 AUX_MASK_SIZE = 256
 AUX_MASK = None
 
+_GLOBAL_WINDOW_SIZE = None
+_LOCAL_WINDOW_SIZE = None
+_BLOCK_M = None
+_BLOCK_N = None
+_COMPRESSED_MASK = None
+
 
 def get_aux_mask():
     global AUX_MASK
@@ -49,13 +55,27 @@ def get_mask_causal_with_window(
         global_window_size: Optional[int] = None,
         device: str = "npu",
 ):
+    global _GLOBAL_WINDOW_SIZE
+    global _LOCAL_WINDOW_SIZE
+    global _BLOCK_M
+    global _BLOCK_N
+    global _COMPRESSED_MASK
+    if (
+        _GLOBAL_WINDOW_SIZE == global_window_size
+        and _LOCAL_WINDOW_SIZE == local_window_size
+        and _BLOCK_M == BLOCK_M
+        and _BLOCK_N == BLOCK_N
+        and _COMPRESSED_MASK is not None
+    ):
+        return _COMPRESSED_MASK
+
     if local_window_size is None:
         local_window_size = 0
     if global_window_size is None:
         global_window_size = 0
 
-    M = (global_window_size + local_window_size + 2 * max(BLOCK_M, BLOCK_N) + BLOCK_M - 1) // BLOCK_M * BLOCK_M
-    N = (global_window_size + local_window_size + 3 * max(BLOCK_M, BLOCK_N) + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+    M = (global_window_size + local_window_size + 4 * max(BLOCK_M, BLOCK_N) + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    N = (global_window_size + local_window_size + 5 * max(BLOCK_M, BLOCK_N) + BLOCK_N - 1) // BLOCK_N * BLOCK_N
 
     causal = torch.ones(M, N, dtype=torch.bool).tril()
 
@@ -66,24 +86,35 @@ def get_mask_causal_with_window(
 
     mask = causal & (sink_band | local_band)
 
-    M_boundary = M + BLOCK_M
-    N_boundary = N + BLOCK_N
+    M_boundary = M + AUX_MASK_SIZE
+    N_boundary = N + AUX_MASK_SIZE
     mask_boundary = torch.zeros(M_boundary, N_boundary, dtype=torch.bool)
     mask_boundary[:M, :N] = mask
-    return mask_boundary.to(device=device)
+    mask_boundary = mask_boundary.to(device=device)
+
+    _GLOBAL_WINDOW_SIZE = global_window_size
+    _LOCAL_WINDOW_SIZE = local_window_size
+    _BLOCK_M = BLOCK_M
+    _BLOCK_N = BLOCK_N
+    _COMPRESSED_MASK = mask_boundary
+    return _COMPRESSED_MASK
 
 
 @triton.jit
 def gen_mask_causal_with_window(mask_ptr_causal, mask_size_m, mask_size_n, M_BLOCK, N_BLOCK, m_start, n_start,
-                                global_window_size, local_windows_size, q_seq_len, kv_seq_len, GEN_MASK_BLOCK_SIZE=256):
-    actual_mask_m = mask_size_m - GEN_MASK_BLOCK_SIZE
+                                global_window_size, local_windows_size, q_seq_len, kv_seq_len, AUX_MASK_SIZE=AUX_MASK_SIZE):
+    if local_windows_size is None:
+        local_windows_size = 0
+    if global_window_size is None:
+        global_window_size = 0
+
+    actual_mask_m = mask_size_m - AUX_MASK_SIZE
     is_q_oob = (m_start >= kv_seq_len).to(tl.int32)
     valid_rows = max(0, min(kv_seq_len - m_start, M_BLOCK))
     is_tail = (valid_rows < M_BLOCK).to(tl.int32)
 
     m_pos_normal = min(m_start, actual_mask_m - M_BLOCK)
-    m_pos_tail = actual_mask_m - valid_rows
-    m_pos = (1 - is_q_oob) * ((1 - is_tail) * m_pos_normal + is_tail * m_pos_tail) + is_q_oob * actual_mask_m
+    m_pos = (1 - is_q_oob) * m_pos_normal + is_q_oob * actual_mask_m
 
     shift = m_start - m_pos
     need_adjust = (shift != 0).to(tl.int32)
@@ -828,7 +859,6 @@ def _swa_paged_prefill_kernel(
                         LOCAL_WINDOW,
                         q_seq_len,
                         kv_seq_len,
-                        GEN_MASK_BLOCK_SIZE=128,
                     )
                 else:
                     mask = tl.full((BLOCK_M, BLOCK_N), 1,  dtype=tl.int1)
@@ -888,7 +918,6 @@ def _swa_paged_prefill_kernel(
                         LOCAL_WINDOW,
                         q_seq_len,
                         kv_seq_len,
-                        GEN_MASK_BLOCK_SIZE=128,
                     )
                 else:
                     mask = tl.full((BLOCK_M, BLOCK_N), 1,  dtype=tl.int1)
@@ -1075,7 +1104,6 @@ def _swa_paged_prefill_small_kernel(
                         LOCAL_WINDOW,
                         q_seq_len,
                         kv_seq_len,
-                        GEN_MASK_BLOCK_SIZE=128,
                     )
                 else:
                     mask = tl.full((BLOCK_M, BLOCK_N), 1,  dtype=tl.int1)
@@ -1542,9 +1570,9 @@ def swa_paged_decode_impl(
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
-        for BM in [64, 128]
-        for BN in [64, 128]
-        for MF in [True, False]
+        for BM in [128]
+        for BN in [128]
+        for MF in [False]
     ],
     key=["HEAD_DIM"],
 )
@@ -1830,7 +1858,9 @@ def swa_fwd_impl(
         BLOCK_D,
         output_f32,
         limit_auto_multi_buffer_buffer="no-limit",
-        hfusion_enable_multiple_consumer_fusion=True
+        hfusion_enable_multiple_consumer_fusion=True,
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
     if output_f32:
         return o, softmax_lse, o_f32
@@ -2010,11 +2040,11 @@ def _sdpa_single_block_bwd_dq(
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
-        for BM in [64, 128, 256]
-        for BN in [64, 128]
-        for MF in [True, False]
+        for BM in [128]
+        for BN in [128]
+        for MF in [False, True]
     ],
-    key=["HEAD_DIM", "LOCAL_WINDOW", "GLOBAL_WINDOW"],
+    key=["HEAD_DIM"],
 )
 @triton.jit
 def _swa_bwd_dkdv_kernel(
@@ -2208,7 +2238,7 @@ def _swa_bwd_dkdv_kernel(
                                                 other=0.0)
                             tl.static_assert(cur_delta.dtype == tl.float32)
                             cur_lse = tl.load(lse_i_ptr + q_offs * stride_lse_t, mask=q_offs < q_seq_len,
-                                              other=-float("inf"))
+                                              other=0.0)
                             tl.static_assert(cur_lse.dtype == tl.float32)
                             dk, dv = _sdpa_single_block_bwd_dkdv(
                                 dk,
@@ -2227,19 +2257,8 @@ def _swa_bwd_dkdv_kernel(
                                 BLOCK_D,
                                 v_ptr.dtype.element_ty == tl.float8e5,
                             )
-                    # tl.extra.cann.extension.compile_hint(dk, "matmul_at_least_once")
-                    # tl.extra.cann.extension.compile_hint(dv, "matmul_at_least_once")
-                    # cur_dk_block_ptr = tl.advance(dk_block_ptr, (kv_block_start.to(tl.int32), 0))
-                    cur_dk_block_ptr = tl.make_block_ptr(
-                        base=dk_ptr + kv_start * stride_dkt + kv_head_id * stride_dkh,
-                        shape=(kv_seq_len, HEAD_DIM),
-                        strides=(stride_dkt, stride_dkd),
-                        offsets=(kv_block_start.to(tl.int32), 0),
-                        block_shape=(BLOCK_N, BLOCK_D),
-                        order=(1, 0),
-                    )
-                    tl.store(cur_dk_block_ptr, dk.to(dk_ptr.type.element_ty), boundary_check=(0, 1))
-                    # cur_dv_block_ptr = tl.advance(dv_block_ptr, (kv_block_start.to(tl.int32), 0))
+                    tl.extra.cann.extension.compile_hint(dv, "matmul_at_least_once")
+                    tl.extra.cann.extension.compile_hint(dk, "matmul_at_least_once")
                     cur_dv_block_ptr = tl.make_block_ptr(
                         base=dv_ptr + kv_start * stride_dvt + kv_head_id * stride_dvh,
                         shape=(kv_seq_len, HEAD_DIM),
@@ -2249,6 +2268,16 @@ def _swa_bwd_dkdv_kernel(
                         order=(1, 0),
                     )
                     tl.store(cur_dv_block_ptr, dv.to(dv_ptr.type.element_ty), boundary_check=(0, 1))
+
+                    cur_dk_block_ptr = tl.make_block_ptr(
+                        base=dk_ptr + kv_start * stride_dkt + kv_head_id * stride_dkh,
+                        shape=(kv_seq_len, HEAD_DIM),
+                        strides=(stride_dkt, stride_dkd),
+                        offsets=(kv_block_start.to(tl.int32), 0),
+                        block_shape=(BLOCK_N, BLOCK_D),
+                        order=(1, 0),
+                    )
+                    tl.store(cur_dk_block_ptr, dk.to(dk_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 @triton.autotune(
@@ -2364,7 +2393,7 @@ def _swa_bwd_dq_kernel(
 
             q_offs = q_block_start + tl.arange(0, BLOCK_M)
             cur_delta = tl.load(delta_i_ptr + q_offs, q_offs < q_seq_len, other=0.0)
-            cur_lse = tl.load(lse_i_ptr + q_offs, q_offs < q_seq_len, other=-float("inf"))
+            cur_lse = tl.load(lse_i_ptr + q_offs, q_offs < q_seq_len, other=0.0)
 
             num_global_window_blocks, non_global_window_start_block, num_total_blocks = _swa_split_blocks(
                 q_block_start + kv_computed_len,
@@ -2559,6 +2588,11 @@ def swa_bwd_impl(
         gqa_interleave,
         head_dim,
         BLOCK_D,
+        limit_auto_multi_buffer_buffer="no-limit",
+        hfusion_enable_multiple_consumer_fusion=True,
+        unit_flag=True,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        intra_cache_num=1,
     )
     _swa_bwd_dq_kernel[grid](
         dq,
@@ -2602,6 +2636,12 @@ def swa_bwd_impl(
         gqa_interleave,
         head_dim,
         BLOCK_D,
+        limit_auto_multi_buffer_buffer="no-limit",
+        hfusion_enable_multiple_consumer_fusion=True,
+        unit_flag=True,
+        limit_auto_multi_buffer_of_local_buffer="no-l0c",
+        intra_cache_num=3,
+        inter_cache_num=2,
     )
 
     return dq, dk, dv
