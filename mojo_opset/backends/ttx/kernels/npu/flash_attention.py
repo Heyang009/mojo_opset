@@ -19,9 +19,11 @@ def _build_lpt_task_schedule(
         cu_q_lens: torch.Tensor,
         seqlens_kv: Optional[torch.Tensor],
         num_q_heads: int,
+        num_kv_heads: int,
         block_size_m: int,
         block_size_n: int,
         cube_num: int,
+        gqa_interleave: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a shape-aware static schedule for the 1D Triton grid.
 
@@ -52,7 +54,10 @@ def _build_lpt_task_schedule(
             q_block_end = min((q_block_id + 1) * block_size_m, q_seq_len)
             cost = max(1, triton.cdiv(kv_cache_len + q_block_end, block_size_n))
             for q_head_id in range(num_q_heads):
-                kv_head_id = q_head_id // (num_q_heads // 4)
+                if gqa_interleave:
+                    kv_head_id = q_head_id % num_kv_heads
+                else:
+                    kv_head_id = q_head_id // (num_q_heads // num_kv_heads)
                 weighted_tasks.append((b_id, kv_head_id, q_block_id, cost, q_head_id, seq_no))
                 seq_no += 1
 
@@ -599,9 +604,11 @@ def paged_attention_prefill_impl(
         cu_q_lens,
         seqlens_kv,
         num_q_heads,
+        num_kv_heads,
         CHUNK_SIZE,
         BLOCK_SIZE_N,
         cube_num,
+        gqa_interleave,
     )
 
     if not (page_size < 128 and 128 % page_size == 0):
