@@ -583,7 +583,7 @@ def causal_conv1d_states_fwd_kernel(
     o_t = eos - BW + tl.arange(0, BW)
     o_d = i_d * BD + tl.arange(0, BD)
     o_w = W - BW + tl.arange(0, BW)
-    m_t = o_t >= tl.maximum(bos, eos - W,propagate_nan=tl.PropagateNan.ALL)
+    m_t = o_t >= tl.maximum(bos, eos - W)
     m_d = o_d < D
     m_w = (o_w >= 0) & (o_w < W)
 
