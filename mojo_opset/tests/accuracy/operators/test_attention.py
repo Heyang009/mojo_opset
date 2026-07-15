@@ -1609,22 +1609,13 @@ def test_paged_prefill_swa_with_graph(
 
 
 test_configs_swa_decode = [
-    (4, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    (8, 8, 1, 128, 4096, 128, torch.bfloat16, "M_BF16_LONG"),
-    # (2, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
-    (2, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
-    # (2, 8, 2, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP1"),
-    (2, 24, 8, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP2"),
-
-    # add perf case
-    (4, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
-    (8, 16, 4, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
-    (8, 8, 1, 128, 4096, 128, torch.bfloat16, "M_BF16_LONG"),
-    (2, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
-    (2, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
-    (2, 8, 2, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP1"),
-    (2, 24, 8, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP2"),
+    (4, -1, 16, 4, 128, 1024, 512, torch.bfloat16, "M_BF16"),
+    (8, -1, 16, 4, 96, 2048, 128, torch.bfloat16, "M_BF16_PADDIM"),
+    (8, -1, 8, 1, 128, 4096, 128, torch.bfloat16, "M_BF16_LONG"),
+    (2, -1, 8, 1, 128, 2048, 1024, torch.bfloat16, "M_BF16_BIGPAGE"),
+    (2, -1, 8, 1, 128, 0, 1024, torch.bfloat16, "M_BF16_PADSEQ"),
+    (2, -1, 8, 2, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP1"),
+    (2, -1, 24, 8, 128, 2048, 1024, torch.bfloat16, "M_BF16_GROUP2"),
 ]
 @pytest.mark.parametrize(
     "query, k_cache, v_cache, total_seq_lens, block_tables, max_total_seq_len",
