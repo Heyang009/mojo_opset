@@ -169,10 +169,12 @@ def get_autotune_config():
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 512}),
         triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}),
         triton.Config({"BLOCK_M": 256, "BLOCK_N": 128}),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 512}),
     ],
     key=["BSZ", "Q_HEAD_NUM", "SEQ", "HEAD_DIM"],
 )
