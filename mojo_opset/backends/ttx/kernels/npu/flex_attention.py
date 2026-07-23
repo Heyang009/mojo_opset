@@ -790,6 +790,273 @@ def flex_attention_backward_dkdv_kernel(
                         )
 
 
+@triton.jit(
+    do_not_specialize=[
+        "stride_mask_m",
+        "stride_partial_p", "stride_partial_m",
+        "stride_partial_table_m",
+        "stride_lse_z", "stride_lse_h", "stride_q_idx_m",
+        "Q_LEN", "KV_LEN", "NUM_TASKS", "NUM_KV_BLOCKS",
+        "stride_qz", "stride_qh",
+        "stride_kz", "stride_kh",
+        "stride_vz", "stride_vh",
+        "stride_doz", "stride_doh",
+        "stride_delta_z", "stride_delta_h",
+        "stride_dkz", "stride_dkh",
+        "stride_dvz", "stride_dvh",
+    ]
+)
+def flex_attention_backward_dkdv_kernel_ordered(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    DELTA,
+    Q_NUM_BLKS,
+    Q_IDX,
+    FULL_Q_NUM_BLKS,
+    FULL_Q_IDX,
+    DENSE_MASK,
+    stride_mask_m,
+    stride_mask_n,
+    PARTIAL_MASK_PACKED,
+    PARTIAL_MASK_OFFSETS,
+    PARTIAL_BLOCK_TABLE,
+    stride_partial_p,
+    stride_partial_m,
+    stride_partial_n,
+    stride_partial_offset_m,
+    stride_partial_table_m,
+    stride_partial_table_n,
+    DK,
+    DV,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_doz, stride_doh, stride_dom, stride_dok,
+    stride_lse_z, stride_lse_h, stride_lse_m,
+    stride_delta_z, stride_delta_h, stride_delta_m,
+    stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+    stride_dvz, stride_dvh, stride_dvn, stride_dvk,
+    stride_q_idx_m,
+    TASK_KV,
+    TASK_ORDER,
+    COUNT,
+    TOTAL_COUNT_SLOTS,
+    SM_SCALE: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SUB_BLOCKS: tl.constexpr,
+    NUM_TASKS,
+    NUM_KV_BLOCKS,
+    KV_HEAD,
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr,
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr,
+    Q_LEN,
+    KV_LEN,
+    GQA_SHARED_HEADS,
+    HAS_FULL_BLOCKS: tl.constexpr = True,
+    USE_PACKED_PARTIAL_MASK: tl.constexpr = False,
+):
+    """Step 5: 有序版 dkdv kernel。
+
+    与原 flex_attention_backward_dkdv_kernel 的差异：
+      - 每个 task = 一个 (kv_block, q_block, order)，从 TASK_KV/TASK_ORDER 表加载
+      - 不再由一个核串行处理整个 kv_block 的所有 q_block
+      - 调用 bwd_dkdv_block_mn_ordered，通过 COUNT 自旋保序累加 DK/DV
+      - COMPUTE_DQ=False，不算 dq（dq 由独立 kernel 处理）
+    """
+    pid = tl.program_id(0).to(tl.int32)
+    num_core = tl.num_programs(0).to(tl.int32)
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+    KV_BLOCK_SIZE: tl.constexpr = BLOCK_N * NUM_KV_SUB_BLOCKS
+
+    offs_k = tl.arange(0, QK_HEAD_DIM)
+    offs_v = tl.arange(0, V_HEAD_DIM)
+
+    sparse_q_multiple = SPARSE_Q_BLOCK_SIZE // BLOCK_M
+    sparse_kv_multiple = SPARSE_KV_BLOCK_SIZE // KV_BLOCK_SIZE
+
+    for task_id in range(pid, NUM_TASKS, num_core):
+        kv_task = tl.load(TASK_KV + task_id)
+        my_order = tl.load(TASK_ORDER + task_id)
+
+        # 拆解 kv_task -> (z, hkv, kv_block_idx)
+        kv_block_idx = kv_task % NUM_KV_BLOCKS
+        off_hkv = (kv_task // NUM_KV_BLOCKS) % KV_HEAD
+        off_z = kv_task // (NUM_KV_BLOCKS * KV_HEAD)
+
+        off_z = off_z.to(tl.int64)
+        off_hkv = off_hkv.to(tl.int64)
+
+        k_offset = off_z * stride_kz + off_hkv * stride_kh
+        v_offset = off_z * stride_vz + off_hkv * stride_vh
+        dk_offset = off_z * stride_dkz + off_hkv * stride_dkh
+        dv_offset = off_z * stride_dvz + off_hkv * stride_dvh
+
+        K_ptr = K + k_offset
+        V_ptr = V + v_offset
+        DK_ptr = DK + dk_offset
+        DV_ptr = DV + dv_offset
+
+        start_n_full = kv_block_idx * KV_BLOCK_SIZE
+        kv_sparse_idx = kv_block_idx // sparse_kv_multiple
+        sparse_q_num_blks_offset = kv_sparse_idx
+        sparse_q_idx_offset = kv_sparse_idx * stride_q_idx_m
+
+        # COUNT 偏移：DV/DK 共用同一槽位（方案 A 已改为共用）
+        count_offset = off_z * (KV_HEAD * NUM_KV_BLOCKS) + off_hkv * NUM_KV_BLOCKS + kv_block_idx
+        count_offset = count_offset.to(tl.int64)
+
+        # 判断 my_order 落在 sparse 段还是 full 段
+        q_num_blocks_sparse = tl.load(Q_NUM_BLKS + sparse_q_num_blks_offset)
+        is_full = my_order >= q_num_blocks_sparse
+
+        if is_full:
+            if not HAS_FULL_BLOCKS:
+                continue
+            order_in_full = my_order - q_num_blocks_sparse
+            q_indices = FULL_Q_IDX + sparse_q_idx_offset
+            q_num_blocks = tl.load(FULL_Q_NUM_BLKS + sparse_q_num_blks_offset)
+            block_m_end = tl.minimum(
+                q_num_blocks * sparse_q_multiple,
+                tl.maximum(tl.cdiv(Q_LEN, BLOCK_M), 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL
+            )
+            # order_in_full 必须在 [0, block_m_end) 范围内
+            if order_in_full >= block_m_end:
+                continue
+            start_m = order_in_full
+            blk_idx_in_list = start_m // sparse_q_multiple
+            q_block = tl.load(q_indices + blk_idx_in_list)
+            q_start = q_block * SPARSE_Q_BLOCK_SIZE + (start_m % sparse_q_multiple) * BLOCK_M
+            offs_m = q_start + tl.arange(0, BLOCK_M)
+
+            # 方案 Y：kernel 层保序锁，q_block 之间严格按 order 顺序
+            while tl.load(COUNT + count_offset) != my_order:
+                pass
+
+            # 加载 k, v（按 kv_sub 拆分）
+            for kv_sub in range(NUM_KV_SUB_BLOCKS):
+                start_n = start_n_full + kv_sub * BLOCK_N
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                k = tl.load(
+                    K_ptr + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk,
+                    mask=(offs_n[:, None] < KV_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+                    other=0.0,
+                )
+                v = tl.load(
+                    V_ptr + offs_n[:, None] * stride_vn + offs_v[None, :] * stride_vk,
+                    mask=(offs_n[:, None] < KV_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+                    other=0.0,
+                )
+
+                # GQA: 每个 kv_head 对应 GQA_SHARED_HEADS 个 q_head，依次累加
+                for off_g in range(0, GQA_SHARED_HEADS):
+                    off_hq = off_hkv * GQA_SHARED_HEADS + off_g
+                    off_hq = off_hq.to(tl.int64)
+                    q_offset = off_z * stride_qz + off_hq * stride_qh
+                    do_offset = off_z * stride_doz + off_hq * stride_doh
+                    lse_offset = off_z * stride_lse_z + off_hq * stride_lse_h
+                    delta_offset = off_z * stride_delta_z + off_hq * stride_delta_h
+
+                    Q_h = Q + q_offset
+                    DO_h = DO + do_offset
+                    LSE_h = LSE + lse_offset
+                    DELTA_h = DELTA + delta_offset
+
+                    bwd_dkdv_block_mn_ordered(
+                        Q_h, DO_h, DK_ptr, DELTA_h, LSE_h, DV_ptr,
+                        DENSE_MASK, stride_mask_m, stride_mask_n,
+                        PARTIAL_MASK_PACKED, stride_partial_p, stride_partial_m, stride_partial_n,
+                        PARTIAL_BLOCK_TABLE, stride_partial_table_m, stride_partial_table_n,
+                        k, v, Q_LEN, KV_LEN,
+                        off_z, off_hq, off_hkv, offs_n, offs_m, start_m, q_block, kv_sparse_idx, kv_sub, offs_k, offs_v,
+                        stride_qm, stride_qk, stride_dom, stride_dok,
+                        stride_dvn, stride_dvk, stride_dkn, stride_dkk,
+                        MATMUL_PRECISION,
+                        SM_SCALE,
+                        SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+                        SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+                        QK_HEAD_DIM=QK_HEAD_DIM,
+                        V_HEAD_DIM=V_HEAD_DIM,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        IS_FULL_BLOCKS=True,
+                        USE_PACKED_PARTIAL_MASK=USE_PACKED_PARTIAL_MASK,
+                    )
+
+            # 所有 kv_sub + off_g 完成，通知下一个 order
+            tl.atomic_add(COUNT + count_offset, 1)
+        else:
+            # sparse 段
+            q_indices = Q_IDX + sparse_q_idx_offset
+            start_m = my_order
+            blk_idx_in_list = start_m // sparse_q_multiple
+            q_block = tl.load(q_indices + blk_idx_in_list)
+            q_start = q_block * SPARSE_Q_BLOCK_SIZE + (start_m % sparse_q_multiple) * BLOCK_M
+            offs_m = q_start + tl.arange(0, BLOCK_M)
+            q_sparse_idx = q_block
+
+            # 方案 Y：kernel 层保序锁，q_block 之间严格按 order 顺序
+            while tl.load(COUNT + count_offset) != my_order:
+                pass
+
+            for kv_sub in range(NUM_KV_SUB_BLOCKS):
+                start_n = start_n_full + kv_sub * BLOCK_N
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                k = tl.load(
+                    K_ptr + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk,
+                    mask=(offs_n[:, None] < KV_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+                    other=0.0,
+                )
+                v = tl.load(
+                    V_ptr + offs_n[:, None] * stride_vn + offs_v[None, :] * stride_vk,
+                    mask=(offs_n[:, None] < KV_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+                    other=0.0,
+                )
+
+                for off_g in range(0, GQA_SHARED_HEADS):
+                    off_hq = off_hkv * GQA_SHARED_HEADS + off_g
+                    off_hq = off_hq.to(tl.int64)
+                    q_offset = off_z * stride_qz + off_hq * stride_qh
+                    do_offset = off_z * stride_doz + off_hq * stride_doh
+                    lse_offset = off_z * stride_lse_z + off_hq * stride_lse_h
+                    delta_offset = off_z * stride_delta_z + off_hq * stride_delta_h
+
+                    Q_h = Q + q_offset
+                    DO_h = DO + do_offset
+                    LSE_h = LSE + lse_offset
+                    DELTA_h = DELTA + delta_offset
+
+                    bwd_dkdv_block_mn_ordered(
+                        Q_h, DO_h, DK_ptr, DELTA_h, LSE_h, DV_ptr,
+                        DENSE_MASK, stride_mask_m, stride_mask_n,
+                        PARTIAL_MASK_PACKED, stride_partial_p, stride_partial_m, stride_partial_n,
+                        PARTIAL_BLOCK_TABLE, stride_partial_table_m, stride_partial_table_n,
+                        k, v, Q_LEN, KV_LEN,
+                        off_z, off_hq, off_hkv, offs_n, offs_m, start_m, q_sparse_idx, kv_sparse_idx, kv_sub, offs_k, offs_v,
+                        stride_qm, stride_qk, stride_dom, stride_dok,
+                        stride_dvn, stride_dvk, stride_dkn, stride_dkk,
+                        MATMUL_PRECISION,
+                        SM_SCALE,
+                        SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+                        SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+                        QK_HEAD_DIM=QK_HEAD_DIM,
+                        V_HEAD_DIM=V_HEAD_DIM,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        IS_FULL_BLOCKS=False,
+                        USE_PACKED_PARTIAL_MASK=USE_PACKED_PARTIAL_MASK,
+                    )
+
+            # 所有 kv_sub + off_g 完成，通知下一个 order
+            tl.atomic_add(COUNT + count_offset, 1)
+
+
 @triton.jit
 def bwd_dkdv_block_mn(
     Q, DO, DQ, DK_ptr, DELTA, LSE, DV_ptr,
@@ -892,6 +1159,106 @@ def bwd_dkdv_block_mn(
     )
 
 
+@triton.jit
+def bwd_dkdv_block_mn_ordered(
+    Q, DO, DK_ptr, DELTA, LSE, DV_ptr,
+    DENSE_MASK, stride_mask_m, stride_mask_n,
+    PARTIAL_MASK_PACKED, stride_partial_p, stride_partial_m, stride_partial_n,
+    PARTIAL_BLOCK_TABLE, stride_partial_table_m, stride_partial_table_n,
+    k, v, Q_LEN, KV_LEN,
+    off_z, off_hq, off_hkv, offs_n, offs_m, start_m, q_sparse_idx, kv_sparse_idx, kv_sub, offs_k, offs_v,
+    stride_qm, stride_qk, stride_dom, stride_dok,
+    stride_dvn, stride_dvk, stride_dkn, stride_dkk,
+    MATMUL_PRECISION,
+    SM_SCALE: tl.constexpr,
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr,
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    IS_FULL_BLOCKS: tl.constexpr,
+    USE_PACKED_PARTIAL_MASK: tl.constexpr,
+):
+    """Step 4: dkdv block 计算（方案 Y：保序锁在 kernel 层，block 内用 atomic_add）。
+
+    与 bwd_dkdv_block_mn 的差异：
+      - 去掉 DQ/COMPUTE_DQ（dkdv 不算 dq）
+      - DK/DV 累加用 atomic_add（同一 q_block 的不同 off_g 写同一位置）
+    保序由 kernel 层的自旋锁 + atomic_add(COUNT, 1) 保证（q_block 之间严格按 order 顺序）。
+    """
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
+        mask=(offs_m[:, None] < Q_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+        other=0.0,
+    )
+    do = tl.load(
+        DO + offs_m[:, None] * stride_dom + offs_v[None, :] * stride_dok,
+        mask=(offs_m[:, None] < Q_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+        other=0.0,
+    )
+    lse = tl.load(LSE + offs_m, mask=offs_m < Q_LEN, other=float("-inf"))
+    lse = tl.where(lse == float("-inf"), 0.0, lse)
+
+    qk = tl.dot(q, tl.trans(k), input_precision="ieee")
+    qk *= SM_SCALE
+
+    if not IS_FULL_BLOCKS:
+        if USE_PACKED_PARTIAL_MASK:
+            partial_block_idx = tl.load(
+                PARTIAL_BLOCK_TABLE
+                + q_sparse_idx * stride_partial_table_m
+                + kv_sparse_idx * stride_partial_table_n
+            )
+            safe_partial_block_idx = tl.maximum(partial_block_idx, 0)
+            sparse_q_multiple = SPARSE_Q_BLOCK_SIZE // BLOCK_M
+            offs_m_in_block = (start_m % sparse_q_multiple) * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_n_in_block = kv_sub * BLOCK_N + tl.arange(0, BLOCK_N)
+            mask = load_packed_partial_mask(
+                PARTIAL_MASK_PACKED,
+                stride_partial_p,
+                stride_partial_m,
+                stride_partial_n,
+                safe_partial_block_idx,
+                offs_m_in_block,
+                offs_n_in_block,
+                SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+                SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+            )
+            mask = mask & (partial_block_idx >= 0)
+        else:
+            mask = load_dense_mask(
+                DENSE_MASK,
+                stride_mask_m,
+                stride_mask_n,
+                offs_m,
+                offs_n,
+                Q_LEN=Q_LEN,
+                KV_LEN=KV_LEN,
+            )
+        qk = tl.where(mask, qk, float("-inf"))
+    p = tl.math.exp(qk - lse[:, None])
+
+    dv = tl.dot(tl.trans(p.to(MATMUL_PRECISION)), do, input_precision="ieee")
+    tl.atomic_add(
+        DV_ptr + offs_n[:, None] * stride_dvn + offs_v[None, :] * stride_dvk,
+        dv,
+        mask=(offs_n[:, None] < KV_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+    )
+
+    Di = tl.load(DELTA + offs_m, mask=offs_m < Q_LEN, other=0.0)
+    dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+    ds = (p * (dp - Di[:, None]))
+    ds *= SM_SCALE
+
+    dk = tl.dot(tl.trans(ds.to(MATMUL_PRECISION)), q, input_precision="ieee")
+    tl.atomic_add(
+        DK_ptr + offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk,
+        dk,
+        mask=(offs_n[:, None] < KV_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+    )
+
+
 def _prepare_block_mask_attrs(block_mask, q, num_q_blocks, sparse_q_block_size, sparse_kv_block_size):
     N = q.shape[0] if q.dim() == 4 else q.shape[2]
     kv_num_blks = block_mask.kv_num_blocks
@@ -966,6 +1333,129 @@ def _prepare_block_mask_attrs(block_mask, q, num_q_blocks, sparse_q_block_size, 
         "partial_block_table": partial_block_table,
         "use_packed_partial_mask": use_packed_partial_mask,
     }
+
+
+def compute_k_count(bm, num_kv_blocks):
+    """Step 1: 生成 K 轴累加次数矩阵 K_COUNT[Z, Hkv, NUM_KV_BLOCKS]。
+
+    每个元素 = 该结果位置 (z, hkv, kv_block) 的有效 Q block 数
+    （= sparse/partial Q block 数 + full Q block 数）。
+    语义等价于扫描 BLOCK_FLAGS 统计非空 block（flag=1 partial + flag=2 full）。
+    后续用作保序累加计数器的初值依据，以及负载判定的输入。
+    """
+    q_num_blks = bm["q_num_blks"]
+    full_q_num_blks = bm["full_q_num_blks"]
+    k_count = (q_num_blks + full_q_num_blks).to(torch.int32).contiguous()
+    return k_count
+
+
+def is_load_imbalanced(k_count, num_cores, threshold=0.2):
+    """Step 2: 判断按 KV 方向分核后是否负载不均。
+
+    判定逻辑：把每个 (z, hkv) 视作一组，组内 NUM_KV_BLOCKS 个任务的计算量
+    以 K_COUNT（有效 Q block 数）衡量。静态调度下每个核被分配
+    ceil(num_kv_blocks / num_cores) 个任务，取各核任务量上限 max_load 与
+    各任务量平均 avg_load，若 (max_load - avg_load) / avg_load > threshold
+    则判为不均，走新算子。
+
+    Args:
+        k_count: [Z, 1, NUM_KV_BLOCKS] int32，每个 kv_block 的有效 Q block 数
+        num_cores: 物理核数（KV 方向分核数）
+        threshold: 计算量差异阈值，默认 0.2（20%）
+    Returns:
+        bool: True 表示负载不均，应走新算子
+    """
+    if num_cores <= 1:
+        return False
+
+    k_count_flat = k_count.reshape(-1, k_count.shape[-1])  # [Z*Hkv, NUM_KV_BLOCKS]
+    num_kv_blocks = k_count_flat.shape[-1]
+    if num_kv_blocks == 0:
+        return False
+
+    for row in range(k_count_flat.shape[0]):
+        loads = k_count_flat[row].to(torch.float32)
+        avg_load = loads.mean().item()
+        if avg_load <= 0:
+            continue
+
+        # 静态调度：前 num_kv_blocks % num_cores 个核多分 1 个任务，
+        # 取最大核负载 = max(前余数核 * (ceil+1), 其余核 * ceil)
+        per_core = (num_kv_blocks + num_cores - 1) // num_cores
+        remainder = num_kv_blocks % num_cores
+        if remainder == 0:
+            max_blocks = per_core
+        else:
+            max_blocks = per_core  # ceil 即最大
+
+        # 最大核负载：贪心取最大的 max_blocks 个任务量之和
+        sorted_loads, _ = loads.sort(descending=True)
+        max_load = sorted_loads[:max_blocks].sum().item()
+        if (max_load - avg_load) / avg_load > threshold:
+            return True
+    return False
+
+
+def build_ordered_task_list(k_count, num_kv_blocks, num_kv_heads):
+    """Step 3: 生成有序任务列表。
+
+    把"对某 kv_block 的某 q_block（sparse_q_block 级别）的计算+保序累加"
+    拆成独立 task，按 (order_in_kv, kv_task_id) 升序排成扁平 task 表：
+      - order 0 层 = 所有 kv_block 的第 0 个 q_block（不同核各拿不同 kv_block，
+        互不争抢同一锁，几乎不等待）
+      - order 1 层 = 所有 kv_block 的第 1 个 q_block
+      - ……
+    核以 pid, pid+num_core, pid+2*num_core, ... 顺序消费 task 表。
+    重任务（高 order）阶段由计数器保序。
+
+    Args:
+        k_count: [Z, 1, NUM_KV_BLOCKS] int32，每个 kv_block 的有效 q_block 数
+                 （sparse_q_block 级别，= q_num_blks + full_q_num_blks）
+        num_kv_blocks: kv block 总数
+        num_kv_heads: kv head 数 (Hkv)
+    Returns:
+        task_kv: [TOTAL_TASKS] int32 - kv 任务 id
+                 = z*Hkv*NUM_KV_BLOCKS + hkv*NUM_KV_BLOCKS + kv_block_idx
+        task_order: [TOTAL_TASKS] int32 - 该 task 在其 kv_block 内的保序序号
+                    （0-based，sparse 段在前，full 段在后）
+    """
+    Z = k_count.shape[0]
+    Hkv = num_kv_heads
+    device = k_count.device
+
+    # K_COUNT 形状 [Z, 1, NUM_KV_BLOCKS]，expand 到 [Z, Hkv, NUM_KV_BLOCKS]
+    # （不同 kv_head 共享同一份 mask，但任务 id / DK/DV 存储位置不同）
+    k_count_expanded = k_count.expand(Z, Hkv, num_kv_blocks).contiguous()
+
+    # 构造每个 (z, hkv, kv_block) 的 kv_task_id 网格
+    z_grid, hkv_grid, kv_grid = torch.meshgrid(
+        torch.arange(Z, device=device, dtype=torch.int32),
+        torch.arange(Hkv, device=device, dtype=torch.int32),
+        torch.arange(num_kv_blocks, device=device, dtype=torch.int32),
+        indexing="ij",
+    )
+    kv_task_id_grid = z_grid * (Hkv * num_kv_blocks) + hkv_grid * num_kv_blocks + kv_grid
+    kv_task_id_flat = kv_task_id_grid.reshape(-1).contiguous()  # [Z*Hkv*NUM_KV_BLOCKS]
+    counts = k_count_expanded.reshape(-1).to(torch.int64)  # [Z*Hkv*NUM_KV_BLOCKS]
+
+    # 每个 kv_task_id 重复 count 次，得到未排序的 task_kv
+    task_kv = torch.repeat_interleave(kv_task_id_flat, counts).to(torch.int32)
+
+    # 生成每个 kv_task_id 的 order 序列 0..count-1，拼接
+    counts_list = counts.tolist()
+    task_order = torch.cat(
+        [torch.arange(c, dtype=torch.int32, device=device) for c in counts_list]
+    )
+
+    # 按 (order, kv_task_id) 升序排：order 优先，同 order 内按 kv_task_id 升序
+    # 排序键 = order * MAX_KV_TASK_ID + kv_task_id，保证 order 主序
+    max_kv_task_id = Z * Hkv * num_kv_blocks
+    sort_key = task_order.to(torch.int64) * max_kv_task_id + task_kv.to(torch.int64)
+    sort_idx = torch.argsort(sort_key, stable=True)
+    task_kv = task_kv[sort_idx].contiguous()
+    task_order = task_order[sort_idx].contiguous()
+
+    return task_kv, task_order
 
 
 def flex_attention_fwd_impl(
@@ -1120,47 +1610,104 @@ def flex_attention_bwd_impl(
     BLOCK_N_DKDV = TILE_BLOCK_SIZE
     NUM_KV_SUB_BLOCKS_VAL = SPARSE_KV_BLOCK_SIZE // BLOCK_N_DKDV
     num_kv_blocks = triton.cdiv(N, SPARSE_KV_BLOCK_SIZE)
-    grid_dkv, num_tasks_dkv = _persistent_launch_config(num_kv_blocks * Z * Hkv)
-    flex_attention_backward_dkdv_kernel[grid_dkv](
-        q, k, v, grad_output, lse, delta,
-        bm["q_num_blks"], bm["q_idx"], bm["full_q_num_blks"], bm["full_q_idx"],
-        bm["dense_mask"], bm["dense_mask"].stride(2), bm["dense_mask"].stride(3),
-        bm["packed_partial_mask"], bm["partial_mask_offsets"], bm["partial_block_table"],
-        bm["packed_partial_mask"].stride(0), bm["packed_partial_mask"].stride(1), bm["packed_partial_mask"].stride(2),
-        bm["partial_mask_offsets"].stride(2),
-        bm["partial_block_table"].stride(0), bm["partial_block_table"].stride(1),
-        dq, dk, dv,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3),
-        lse.stride(0), lse.stride(1), lse.stride(2),
-        delta.stride(0), delta.stride(1), delta.stride(2),
-        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-        bm["q_idx"].stride(2),
-        SM_SCALE=sm_scale,
-        QK_HEAD_DIM=D,
-        V_HEAD_DIM=Dv,
-        BLOCK_M=BLOCK_M_DKDV,
-        BLOCK_N=BLOCK_N_DKDV,
-        NUM_KV_SUB_BLOCKS=NUM_KV_SUB_BLOCKS_VAL,
-        NUM_TASKS=num_tasks_dkv,
-        NUM_KV_BLOCKS=num_kv_blocks,
-        KV_HEAD=Hkv,
-        SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
-        SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
-        Q_LEN=M,
-        KV_LEN=N,
-        GQA_SHARED_HEADS=GQA_SHARED_HEADS,
-        HAS_FULL_BLOCKS=True,
-        USE_PACKED_PARTIAL_MASK=bm["use_packed_partial_mask"],
-        limit_auto_multi_buffer_buffer="no-limit",
-        hfusion_enable_multiple_consumer_fusion=True,
-        #unit_flag=True,
-        limit_auto_multi_buffer_of_local_buffer="no-l0c",
-        intra_cache_num=2,
-        inter_cache_num=1,
-    )
+
+    # Step 6: 负载判定，决定走原算子还是新算子
+    k_count = compute_k_count(bm, num_kv_blocks)
+    num_cores_dkdv = _get_num_aicore()
+    use_ordered_kernel = is_load_imbalanced(k_count, num_cores_dkdv)
+
+    if use_ordered_kernel:
+        # 新算子：任务排布 + 保序累加
+        task_kv, task_order = build_ordered_task_list(k_count, num_kv_blocks, Hkv)
+        num_tasks_ordered = task_kv.shape[0]
+        total_count_slots = Z * Hkv * num_kv_blocks
+        count_buffer = torch.zeros(total_count_slots, dtype=torch.int32, device=q.device)
+        grid_dkv_ord, num_tasks_ord = _persistent_launch_config(num_tasks_ordered)
+
+        flex_attention_backward_dkdv_kernel_ordered[grid_dkv_ord](
+            q, k, v, grad_output, lse, delta,
+            bm["q_num_blks"], bm["q_idx"], bm["full_q_num_blks"], bm["full_q_idx"],
+            bm["dense_mask"], bm["dense_mask"].stride(2), bm["dense_mask"].stride(3),
+            bm["packed_partial_mask"], bm["partial_mask_offsets"], bm["partial_block_table"],
+            bm["packed_partial_mask"].stride(0), bm["packed_partial_mask"].stride(1), bm["packed_partial_mask"].stride(2),
+            bm["partial_mask_offsets"].stride(2),
+            bm["partial_block_table"].stride(0), bm["partial_block_table"].stride(1),
+            dk, dv,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            bm["q_idx"].stride(2),
+            task_kv, task_order, count_buffer, total_count_slots,
+            SM_SCALE=sm_scale,
+            QK_HEAD_DIM=D,
+            V_HEAD_DIM=Dv,
+            BLOCK_M=BLOCK_M_DKDV,
+            BLOCK_N=BLOCK_N_DKDV,
+            NUM_KV_SUB_BLOCKS=NUM_KV_SUB_BLOCKS_VAL,
+            NUM_TASKS=num_tasks_ord,
+            NUM_KV_BLOCKS=num_kv_blocks,
+            KV_HEAD=Hkv,
+            SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+            SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+            Q_LEN=M,
+            KV_LEN=N,
+            GQA_SHARED_HEADS=GQA_SHARED_HEADS,
+            HAS_FULL_BLOCKS=True,
+            USE_PACKED_PARTIAL_MASK=bm["use_packed_partial_mask"],
+            limit_auto_multi_buffer_buffer="no-limit",
+            hfusion_enable_multiple_consumer_fusion=True,
+            limit_auto_multi_buffer_of_local_buffer="no-l0c",
+            intra_cache_num=2,
+            inter_cache_num=1,
+        )
+    else:
+        # 原算子：静态调度
+        grid_dkv, num_tasks_dkv = _persistent_launch_config(num_kv_blocks * Z * Hkv)
+        flex_attention_backward_dkdv_kernel[grid_dkv](
+            q, k, v, grad_output, lse, delta,
+            bm["q_num_blks"], bm["q_idx"], bm["full_q_num_blks"], bm["full_q_idx"],
+            bm["dense_mask"], bm["dense_mask"].stride(2), bm["dense_mask"].stride(3),
+            bm["packed_partial_mask"], bm["partial_mask_offsets"], bm["partial_block_table"],
+            bm["packed_partial_mask"].stride(0), bm["packed_partial_mask"].stride(1), bm["packed_partial_mask"].stride(2),
+            bm["partial_mask_offsets"].stride(2),
+            bm["partial_block_table"].stride(0), bm["partial_block_table"].stride(1),
+            dq, dk, dv,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            bm["q_idx"].stride(2),
+            SM_SCALE=sm_scale,
+            QK_HEAD_DIM=D,
+            V_HEAD_DIM=Dv,
+            BLOCK_M=BLOCK_M_DKDV,
+            BLOCK_N=BLOCK_N_DKDV,
+            NUM_KV_SUB_BLOCKS=NUM_KV_SUB_BLOCKS_VAL,
+            NUM_TASKS=num_tasks_dkv,
+            NUM_KV_BLOCKS=num_kv_blocks,
+            KV_HEAD=Hkv,
+            SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+            SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+            Q_LEN=M,
+            KV_LEN=N,
+            GQA_SHARED_HEADS=GQA_SHARED_HEADS,
+            HAS_FULL_BLOCKS=True,
+            USE_PACKED_PARTIAL_MASK=bm["use_packed_partial_mask"],
+            limit_auto_multi_buffer_buffer="no-limit",
+            hfusion_enable_multiple_consumer_fusion=True,
+            #unit_flag=True,
+            limit_auto_multi_buffer_of_local_buffer="no-l0c",
+            intra_cache_num=2,
+            inter_cache_num=1,
+        )
 
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)

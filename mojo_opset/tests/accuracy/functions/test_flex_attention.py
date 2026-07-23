@@ -798,6 +798,101 @@ def test_flex_attention(mask_func):
 
 
 # ============================================================================
+# Small shape test for load-imbalance optimization verification
+# Shape: [72, 4096, 987] (3 seqs), Q_HEAD=4, KV_HEAD=1, HEAD_DIM=128
+# This shape triggers KV-direction load imbalance (41 kv_blocks vs 28 cores)
+# and exercises the ordered dkdv kernel path.
+# ============================================================================
+DATA_LENGTH_SMALL = [[72, 4096, 987]]
+NUM_Q_HEADS_SMALL = 4
+NUM_KV_HEADS_SMALL = 1
+
+
+def build_problem_small(mask_mod):
+    """构建小 shape problem，复用 build_problem 逻辑但覆盖关键参数。"""
+    device = _device()
+    torch.manual_seed(SEED)
+    local_data_len = DATA_LENGTH_SMALL
+
+    num_q_heads = NUM_Q_HEADS_SMALL
+    num_kv_heads = NUM_KV_HEADS_SMALL
+
+    sample_lens = [sum(s) for s in local_data_len]
+    cu_seqlens = torch.tensor([0, *torch.tensor(sample_lens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    total_s = int(cu_seqlens[-1].item())
+    segment_ids = torch.repeat_interleave(
+        torch.arange(len(sample_lens), device=device, dtype=torch.int32),
+        torch.tensor(sample_lens, device=device),
+    )
+    doc_start = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens.diff()).to(torch.long)
+
+    q = torch.rand(1, num_q_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
+    k = torch.rand(1, num_kv_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
+    v = torch.rand(1, num_kv_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
+
+    # 小 shape 仅支持非 video mask（sparse/full 等），复用 modality 构建逻辑
+    modality = _build_modality_indicators(device=device, data_length=DATA_LENGTH_SMALL)
+    return {
+        "q": q, "k": k, "v": v,
+        "segment_ids": segment_ids.long(), "modality": modality, "doc_start": doc_start,
+        "cu_seqlens": cu_seqlens, "total_s": total_s,
+        "sliding_window": SLIDING_WINDOW, "global_window": GLOBAL_WINDOW,
+        "num_q_heads": num_q_heads, "num_kv_heads": num_kv_heads, "head_dim": HEAD_DIM,
+    }
+
+
+@_mask_func_param
+@pytest.mark.skipif(get_platform() != "npu", reason="FlexAttention TTX backend requires NPU")
+@bypass_not_implemented
+def test_flex_attention_small(mask_func):
+    """小 shape 验证：触发负载不均，走有序 dkdv kernel，对比 mojo vs sdpa ref 精度。"""
+    problem = build_problem_small(mask_func)
+
+    q_base = problem["q"]
+    k_base = problem["k"]
+    v_base = problem["v"]
+
+    q_mojo = q_base.detach().clone().requires_grad_(True)
+    k_mojo = k_base.detach().clone().requires_grad_(True)
+    v_mojo = v_base.detach().clone().requires_grad_(True)
+
+    q_ref = q_base.detach().clone().requires_grad_(True)
+    k_ref = k_base.detach().clone().requires_grad_(True)
+    v_ref = v_base.detach().clone().requires_grad_(True)
+
+    SEQ_LEN = problem["total_s"]
+
+    packed_block_mask = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    _sync()
+
+    return_grid = torch.tensor(520000, dtype=DTYPE, device=torch.device(_device()))
+
+    mojo_output = _flex_attention_mojo(q_mojo, k_mojo, v_mojo, None, packed_block_mask, 0.0, None)
+    _sync()
+
+    dense_mask = _build_dense_mask(mask_func, problem)
+    _sync()
+    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>small dense_mask.sum().item()", dense_mask.to("cpu").sum().item())
+
+    ref_output = _sdpa_with_dense_mask(q_ref, k_ref, v_ref, dense_mask, 0.0, None)
+    _sync()
+
+    assert mojo_output.shape == ref_output.shape
+    torch.testing.assert_close(mojo_output.cpu(), ref_output.cpu(), atol=5e-3, rtol=5e-3)
+    _sync()
+
+    mojo_output.float().mean().backward(return_grid)
+    _sync()
+
+    ref_output.float().mean().backward(return_grid)
+    _sync()
+
+    torch.testing.assert_close(q_mojo.grad.cpu(), q_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(k_mojo.grad.cpu(), k_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(v_mojo.grad.cpu(), v_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
+
+
+# ============================================================================
 # Performance benchmark (torch_npu.profiler based)
 # ============================================================================
 def _perf_benchmark(label, build_mask_fn, fwd_fn, q, k, v, prof_dir_root, mask_func):
