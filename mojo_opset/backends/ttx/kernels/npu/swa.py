@@ -199,7 +199,7 @@ def _swa_transposed_range_blocks(
         cur_q_end = q_seq_len
 
     start_block = cur_q_start // BLOCK_SIZE_M
-    end_block = tl.cdiv(cur_q_end, BLOCK_SIZE_M)
+    end_block = min(tl.cdiv(cur_q_end, BLOCK_SIZE_M), tl.cdiv(q_seq_len, BLOCK_SIZE_M))
     return start_block, end_block
 
 

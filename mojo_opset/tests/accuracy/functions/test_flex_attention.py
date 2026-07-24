@@ -17,6 +17,7 @@ from mojo_opset.experimental import mojo_flex_attention
 from mojo_opset.tests.utils import bypass_not_implemented
 from mojo_opset.utils.platform import get_platform
 from mojo_opset.utils.platform import get_torch_device
+from mojo_opset.backends.ttx.kernels.npu.utils import is_910
 
 
 # NPU device validation monkey-patch (same as original test)
@@ -57,7 +58,7 @@ SEED = 0
 APPLY_Q_CHUNK = 2048
 Q_BLOCK_SIZE = 128
 KV_BLOCK_SIZE = 128
-MASK_BLOCK_SIZE = Q_BLOCK_SIZE
+MASK_BLOCK_SIZE = Q_BLOCK_SIZE if not is_910() else 64
 
 _WARMUP = 1
 _ITERS = 3
@@ -410,7 +411,7 @@ def _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE
     stripe_caches = []
     stripe_meta = []
     running_total = 0
-
+    
     for qs_block in range(0, Q_NUM_BLOCKS, stripe_q_blocks):
         qe_block = min(qs_block + stripe_q_blocks, Q_NUM_BLOCKS)
         q_start = qs_block * Q_BLOCK_SIZE
@@ -1030,9 +1031,9 @@ def test_flex_attention(mask_func):
 
     SEQ_LEN = problem["total_s"]
 
-
     if GEN_MASK_TRITON:
-        packed_block_mask = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+        classify_strategy= "fused" if not is_910() else "decoupled"
+        packed_block_mask = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
     else:
         packed_block_mask = create_block_mask_patched(
             mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
@@ -1176,12 +1177,14 @@ def _perf_flex_attention(mask_func, problem=None):
 
     def _build_packed_mask():
         if GEN_MASK_TRITON:
-            pbm = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+            classify_strategy= "fused" if not is_910() else "decoupled"
+            pbm = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
         else:
             pbm = create_block_mask_patched(
                 mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
                 device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
             )
+
         torch.npu.empty_cache()
         return pbm
 
