@@ -5,16 +5,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import triton
-import triton.language as tl
-
-from torch.nn.attention.flex_attention import _create_sparse_block_from_block_mask
-
 from mojo_opset.experimental import mojo_flex_attention
 from mojo_opset.tests.utils import bypass_not_implemented
 from mojo_opset.utils.platform import get_platform
 from mojo_opset.utils.platform import get_torch_device
 from mojo_opset.backends.ttx.kernels.npu.utils import is_910
+from mojo_opset.backends.ttx.kernels.npu.flex_attention import _build_packed_block_mask_streaming
+from mojo_opset.backends.ttx.kernels.npu.flex_attention import create_block_mask_patched
+from mojo_opset.backends.ttx.kernels.npu.flex_attention import triton_create_mask
+from mojo_opset.backends.ttx.kernels.npu.flex_attention import MASK_BLOCK_SIZE
 
 
 # NPU device validation monkey-patch (same as original test)
@@ -35,6 +34,9 @@ NUM_KV_HEADS = 8
 SLIDING_WINDOW = 1024
 GLOBAL_WINDOW = 4
 
+
+GEN_MASK_TRITON = False
+
 DATA_LENGTH = [[2000, 22000, 2000], [2000, 22000, 2000]]
 DATA_INPUT_TYPE = [["text", "image_gen", "text"], ["text", "image_gen", "text"]]
 FULL_MASK_MODALITIES = ("image_gen", "image_vae")
@@ -52,7 +54,6 @@ SEED = 0
 APPLY_Q_CHUNK = 2048
 Q_BLOCK_SIZE = 128
 KV_BLOCK_SIZE = 128
-MASK_BLOCK_SIZE = Q_BLOCK_SIZE if not is_910() else 64
 
 _WARMUP = 1
 _ITERS = 3
@@ -68,444 +69,6 @@ def _sync():
         torch.npu.synchronize()
     elif _device() == "cuda":
         torch.cuda.synchronize()
-
-
-def _get_num_vector_core():
-    try:
-        dev = torch.npu.current_device()
-        props = triton.runtime.driver.active.utils.get_device_properties(dev)
-        return max(int(props.get("num_vectorcore", 1)), 1)
-    except Exception:
-        return 1
-
-
-def _round_up_to_multiple(x, multiple):
-    return (x + multiple - 1) // multiple * multiple
-
-
-# ============================================================================
-# Kernel: create_mask_kernel
-# ============================================================================
-@triton.jit
-def create_mask_kernel(
-    OUT, stride_ob, stride_oh, stride_oq, stride_ok: tl.constexpr,
-    BLOCK_FLAGS, stride_bf_q, stride_bf_k,
-    TABLE1, stride_t1, TABLE2, stride_t2, TABLE3, stride_t3,
-    Q_LEN, KV_LEN, W, G,
-    Q_OFFSET,
-    MASK_TYPE: tl.constexpr, TILE: tl.constexpr,
-    STORE_MASK: tl.constexpr, CLASSIFY: tl.constexpr,
-):
-    pid_q = tl.program_id(0).to(tl.int32)
-    pid_k = tl.program_id(1).to(tl.int32)
-    q_off = Q_OFFSET + pid_q * TILE + tl.arange(0, TILE)
-    k_off = pid_k * TILE + tl.arange(0, TILE)
-    q_idx = q_off[:, None]
-    k_idx = k_off[None, :]
-
-    if MASK_TYPE == 0:
-        seg_q = tl.load(TABLE1 + q_idx * stride_t1, mask=q_idx < Q_LEN, other=0)
-        seg_k = tl.load(TABLE1 + k_idx * stride_t1, mask=k_idx < KV_LEN, other=-1)
-        same_doc = seg_q == seg_k
-        causal = q_idx >= k_idx
-        window = causal & ((q_idx - k_idx) <= W)
-        ds_q = tl.load(TABLE2 + q_idx * stride_t2, mask=q_idx < Q_LEN, other=0)
-        glob = causal & (k_idx >= ds_q) & (k_idx < ds_q + G)
-        sparse = same_doc & (window | glob)
-        mod_q = tl.load(TABLE3 + q_idx * stride_t3, mask=q_idx < Q_LEN, other=-1)
-        mod_k = tl.load(TABLE3 + k_idx * stride_t3, mask=k_idx < KV_LEN, other=-2)
-        is_img = mod_q > 0
-        same_img = is_img & (mod_q == mod_k)
-        result = sparse | same_img
-    elif MASK_TYPE == 1:
-        vid_q = tl.load(TABLE1 + q_idx * stride_t1, mask=q_idx < Q_LEN, other=-1)
-        vid_k = tl.load(TABLE1 + k_idx * stride_t1, mask=k_idx < KV_LEN, other=-2)
-        same_doc = vid_q == vid_k
-        fid_q = tl.load(TABLE2 + q_idx * stride_t2, mask=q_idx < Q_LEN, other=0)
-        fid_k = tl.load(TABLE2 + k_idx * stride_t2, mask=k_idx < KV_LEN, other=-1)
-        frame_causal = fid_q >= fid_k
-        result = same_doc & frame_causal
-    elif MASK_TYPE == 2:
-        vid_q = tl.load(TABLE1 + q_idx * stride_t1, mask=q_idx < Q_LEN, other=-1)
-        vid_k = tl.load(TABLE1 + k_idx * stride_t1, mask=k_idx < KV_LEN, other=-2)
-        same_video = vid_q == vid_k
-        fid_q = tl.load(TABLE2 + q_idx * stride_t2, mask=q_idx < Q_LEN, other=0)
-        fid_k = tl.load(TABLE2 + k_idx * stride_t2, mask=k_idx < KV_LEN, other=-1)
-        same_frame = fid_q == fid_k
-        prev_frame = fid_q > fid_k
-        result = same_video & (same_frame | prev_frame)
-    elif MASK_TYPE == 3:
-        causal = q_idx >= k_idx
-        mod_q = tl.load(TABLE1 + q_idx * stride_t1, mask=q_idx < Q_LEN, other=-1)
-        mod_k = tl.load(TABLE1 + k_idx * stride_t1, mask=k_idx < KV_LEN, other=-2)
-        is_video = mod_q > 0
-        same_video = is_video & (mod_q == mod_k)
-        result = causal | same_video
-    elif MASK_TYPE == 4:
-        seg_q = tl.load(TABLE1 + q_idx * stride_t1, mask=q_idx < Q_LEN, other=-1)
-        seg_k = tl.load(TABLE1 + k_idx * stride_t1, mask=k_idx < KV_LEN, other=-2)
-        same_doc = seg_q == seg_k
-        causal = q_idx >= k_idx
-        samedoc_causal = same_doc & causal
-        mod_q = tl.load(TABLE3 + q_idx * stride_t3, mask=q_idx < Q_LEN, other=-1)
-        mod_k = tl.load(TABLE3 + k_idx * stride_t3, mask=k_idx < KV_LEN, other=-2)
-        is_img = mod_q > 0
-        same_img = is_img & (mod_q == mod_k)
-        result = samedoc_causal | same_img
-    else:
-        result = tl.full([TILE, TILE], False, tl.int1)
-
-    valid = (q_idx < Q_LEN) & (k_idx < KV_LEN)
-
-    if STORE_MASK:
-        q_store = (pid_q * TILE + tl.arange(0, TILE))[:, None]
-        ptrs = OUT + q_store * stride_oq + k_idx * stride_ok
-        tl.store(ptrs, result, mask=valid)
-
-    if CLASSIFY:
-        result_i = tl.where(valid, result.to(tl.int32), 0)
-        has_one = tl.max(tl.max(result_i, axis=1), axis=0) != 0
-        all_one = tl.min(tl.min(result_i, axis=1), axis=0) != 0
-        flag = tl.where(all_one, 2, tl.where(has_one, 1, 0))
-        tl.store(BLOCK_FLAGS + pid_q * stride_bf_q + pid_k * stride_bf_k, flag.to(tl.int8))
-
-
-_MASK_TYPE_MAP = {
-    "sparse": 0, "stair": 1, "video_stair": 2,
-    "cross_sample_causal_video_bidir": 3, "full": 4,
-}
-
-
-def _get_mask_kernel_tables(problem, mt):
-    """Extract table tensors, strides, and W/G values for create_mask_kernel based on mask type."""
-    device = problem["q"].device
-    t1 = t2 = t3 = torch.empty(0, device=device)
-    s1 = s2 = s3 = 0
-    W_val = G_val = 0
-
-    if mt == 0:
-        t1, t2, t3 = problem["segment_ids"], problem["doc_start"], problem["modality"]
-        s1, s2, s3 = t1.stride(0), t2.stride(0), t3.stride(0)
-        W_val = problem["sliding_window"]
-        G_val = problem["global_window"]
-    elif mt in (1, 2):
-        t1, t2 = problem["video_ids"], problem["frame_ids"]
-        s1, s2 = t1.stride(0), t2.stride(0)
-    elif mt == 3:
-        t1 = problem["modality"]
-        s1 = t1.stride(0)
-    elif mt == 4:
-        t1, t3 = problem["segment_ids"], problem["modality"]
-        s1, s3 = t1.stride(0), t3.stride(0)
-
-    return t1, s1, t2, s2, t3, s3, W_val, G_val
-
-
-def triton_create_mask(problem, mask_type, tile_size=MASK_BLOCK_SIZE):
-    SEQ_LEN = problem["total_s"]
-    device = problem["q"].device
-    out = torch.empty(1, 1, SEQ_LEN, SEQ_LEN, dtype=torch.bool, device=device)
-    mt = _MASK_TYPE_MAP[mask_type]
-    t1, s1, t2, s2, t3, s3, W_val, G_val = _get_mask_kernel_tables(problem, mt)
-
-    n_tiles = (SEQ_LEN + tile_size - 1) // tile_size
-    dummy_flags = torch.empty(0, dtype=torch.int8, device=device)
-    create_mask_kernel[(n_tiles, n_tiles)](
-        out, out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        dummy_flags, 0, 0,
-        t1, s1, t2, s2, t3, s3,
-        SEQ_LEN, SEQ_LEN, W_val, G_val,
-        Q_OFFSET=0,
-        MASK_TYPE=mt, TILE=tile_size,
-        STORE_MASK=True, CLASSIFY=False,
-    )
-    return out
-
-
-def _run_create_mask_stripe(problem, mask_type, q_start, q_height, kv_len_padded,
-                             out_buffer, flags_buffer=None, tile_size=MASK_BLOCK_SIZE):
-    """Run create_mask_kernel for a stripe.
-
-    If flags_buffer is provided, also classify blocks (CLASSIFY=True).
-    Otherwise only generate the dense mask (CLASSIFY=False).
-    """
-    SEQ_LEN = problem["total_s"]
-    device = problem["q"].device
-    mt = _MASK_TYPE_MAP[mask_type]
-    t1, s1, t2, s2, t3, s3, W_val, G_val = _get_mask_kernel_tables(problem, mt)
-
-    n_tiles_q = q_height // tile_size
-    n_tiles_k = kv_len_padded // tile_size
-
-    # 生成mask + classify for A5
-    if flags_buffer is not None:
-        create_mask_kernel[(n_tiles_q, n_tiles_k)](
-            out_buffer, out_buffer.stride(0), out_buffer.stride(1), out_buffer.stride(2), out_buffer.stride(3),
-            flags_buffer, flags_buffer.stride(0), flags_buffer.stride(1),
-            t1, s1, t2, s2, t3, s3,
-            SEQ_LEN, SEQ_LEN, W_val, G_val,
-            Q_OFFSET=q_start,
-            MASK_TYPE=mt, TILE=tile_size,
-            STORE_MASK=True, CLASSIFY=True,
-        )
-    # 只生成mask
-    else:
-        dummy_flags = torch.empty(0, dtype=torch.int8, device=device)
-        create_mask_kernel[(n_tiles_q, n_tiles_k)](
-            out_buffer, out_buffer.stride(0), out_buffer.stride(1), out_buffer.stride(2), out_buffer.stride(3),
-            dummy_flags, 0, 0,
-            t1, s1, t2, s2, t3, s3,
-            SEQ_LEN, SEQ_LEN, W_val, G_val,
-            Q_OFFSET=q_start,
-            MASK_TYPE=mt, TILE=tile_size,
-            STORE_MASK=True, CLASSIFY=False,
-        )
-
-
-# ============================================================================
-# Kernel: block_classify_kernel
-# ============================================================================
-@triton.jit(
-    do_not_specialize=["stride_mq", "Q_NUM_BLOCKS", "KV_NUM_BLOCKS", "NUM_TASKS"]
-)
-def block_classify_kernel(
-    DENSE_MASK, stride_mb, stride_mh, stride_mq, stride_mk: tl.constexpr,
-    BLOCK_FLAGS, stride_fb, stride_fh, stride_fqb, stride_fkb,
-    Q_LEN, KV_LEN, NUM_TASKS,
-    H: tl.constexpr, Q_NUM_BLOCKS, KV_NUM_BLOCKS,
-    Q_BLOCK_SIZE: tl.constexpr, KV_BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int32)
-    num_core = tl.num_programs(0).to(tl.int32)
-    num_blocks_per_bh = Q_NUM_BLOCKS * KV_NUM_BLOCKS
-    TILE_M: tl.constexpr = 64
-    TILE_N: tl.constexpr = 64
-
-    for task_id in range(pid, NUM_TASKS, num_core):
-        off_bh = task_id // num_blocks_per_bh
-        off_inner = task_id % num_blocks_per_bh
-        off_b = (off_bh // H).to(tl.int64)
-        off_h = (off_bh % H).to(tl.int64)
-        off_qb = (off_inner // KV_NUM_BLOCKS).to(tl.int64)
-        off_kb = (off_inner % KV_NUM_BLOCKS).to(tl.int64)
-
-        has_one = tl.full((), 0, dtype=tl.int32)
-        all_one = tl.full((), 1, dtype=tl.int32)
-        mask_base = DENSE_MASK + off_b * stride_mb + off_h * stride_mh
-
-        for m0 in range(0, Q_BLOCK_SIZE, TILE_M):
-            offs_m = off_qb * Q_BLOCK_SIZE + m0 + tl.arange(0, TILE_M)
-            valid_m = offs_m < Q_LEN
-            for n0 in range(0, KV_BLOCK_SIZE, TILE_N):
-                offs_n = off_kb * KV_BLOCK_SIZE + n0 + tl.arange(0, TILE_N)
-                valid_n = offs_n < KV_LEN
-                valid = valid_m[:, None] & valid_n[None, :]
-                ptrs = mask_base + offs_m[:, None] * stride_mq + offs_n[None, :] * stride_mk
-                vals = tl.load(ptrs, mask=valid, other=0).to(tl.int32)
-                tile_any = tl.max(tl.max(tl.where(valid, vals, 0), axis=1), axis=0)
-                tile_all = tl.min(tl.min(tl.where(valid, vals, 0), axis=1), axis=0)
-                has_one = tl.where(tile_any != 0, 1, has_one)
-                all_one = tl.where(tile_all == 0, 0, all_one)
-
-        partial = (has_one == 1) & (all_one == 0)
-        full = all_one == 1
-        flag = tl.where(full, 2, tl.where(partial, 1, 0))
-        out_ptr = BLOCK_FLAGS + off_b * stride_fb + off_h * stride_fh + off_qb * stride_fqb + off_kb * stride_fkb
-        tl.store(out_ptr, flag.to(tl.int8))
-
-
-def _classify_stripe_from_hbm(stripe_buffer, q_height, kv_len, flags_buf, Q_BLOCK_SIZE, KV_BLOCK_SIZE):
-    """Decoupled classify: read dense mask from HBM and classify block flags.
-    Uses block_classify_kernel (separate from mask generation)."""
-    Q_NUM_BLOCKS = _round_up_to_multiple(q_height, Q_BLOCK_SIZE) // Q_BLOCK_SIZE
-    KV_NUM_BLOCKS = _round_up_to_multiple(kv_len, KV_BLOCK_SIZE) // KV_BLOCK_SIZE
-    num_tasks = Q_NUM_BLOCKS * KV_NUM_BLOCKS
-    grid = (min(_get_num_vector_core(), max(num_tasks, 1)),)
-    block_classify_kernel[grid](
-        stripe_buffer, stripe_buffer.stride(0), stripe_buffer.stride(1), stripe_buffer.stride(2), stripe_buffer.stride(3),
-        flags_buf, 0, 0, flags_buf.stride(0), flags_buf.stride(1),
-        q_height, kv_len, NUM_TASKS=num_tasks, H=1,
-        Q_NUM_BLOCKS=Q_NUM_BLOCKS, KV_NUM_BLOCKS=KV_NUM_BLOCKS,
-        Q_BLOCK_SIZE=Q_BLOCK_SIZE, KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-    )
-
-
-# ============================================================================
-# Kernel: pack_partial_blocks_kernel
-# ============================================================================
-@triton.jit(
-    do_not_specialize=[
-        "stride_mq", "stride_mk", "stride_offset_q",
-        "stride_local_q", "stride_local_k",
-        "stride_flag_q", "stride_flag_k",
-        "stride_table_q", "stride_table_k",
-        "Q_NUM_BLOCKS", "KV_NUM_BLOCKS", "TOTAL_PARTIAL",
-    ]
-)
-def pack_partial_blocks_kernel(
-    DENSE_MASK, stride_mb, stride_mh, stride_mq, stride_mk: tl.constexpr,
-    BLOCK_FLAGS, stride_flag_q, stride_flag_k: tl.constexpr,
-    PARTIAL_OFFSETS, stride_offset_q,
-    LOCAL_IDX, stride_local_q, stride_local_k,
-    PACKED_MASK, stride_packed_p, stride_packed_m, stride_packed_n: tl.constexpr,
-    BLOCK_TABLE, stride_table_q, stride_table_k: tl.constexpr,
-    Q_LEN, KV_LEN, Q_NUM_BLOCKS, KV_NUM_BLOCKS, TOTAL_PARTIAL,
-    Q_BLOCK_SIZE: tl.constexpr, KV_BLOCK_SIZE: tl.constexpr,
-):
-    pid_q = tl.program_id(0).to(tl.int64)
-    if pid_q >= Q_NUM_BLOCKS:
-        return
-
-    row_offset = tl.load(PARTIAL_OFFSETS + pid_q * stride_offset_q).to(tl.int32)
-    offs_m_local = tl.arange(0, Q_BLOCK_SIZE)[:, None].to(tl.int64)
-    offs_n_local = tl.arange(0, KV_BLOCK_SIZE)[None, :].to(tl.int64)
-
-    for kv_idx in range(KV_NUM_BLOCKS):
-        flag = tl.load(BLOCK_FLAGS + pid_q * stride_flag_q + kv_idx * stride_flag_k).to(tl.int32)
-        is_partial = flag == 1
-        if is_partial:
-            local_idx = tl.load(LOCAL_IDX + pid_q * stride_local_q + kv_idx * stride_local_k).to(tl.int32)
-            packed_idx = (row_offset + local_idx - 1).to(tl.int64)
-            offs_m = (pid_q * Q_BLOCK_SIZE + tl.arange(0, Q_BLOCK_SIZE))[:, None].to(tl.int64)
-            offs_n = (kv_idx * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE))[None, :].to(tl.int64)
-            valid_src = (offs_m < Q_LEN) & (offs_n < KV_LEN)
-            src_ptrs = DENSE_MASK + offs_m * stride_mq + offs_n * stride_mk
-            block = tl.load(src_ptrs, mask=valid_src, other=0)
-            dst_ptrs = PACKED_MASK + packed_idx * stride_packed_p + offs_m_local * stride_packed_m + offs_n_local * stride_packed_n
-            tl.store(dst_ptrs, block)
-            tl.store(BLOCK_TABLE + pid_q * stride_table_q + kv_idx * stride_table_k, packed_idx.to(tl.int32))
-
-
-# Target memory per stripe for streaming mask build (~256 MB of bool dense mask)
-_STRIPE_TARGET_BYTES = 256 * _MB
-
-
-def _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-                                        stripe_q_blocks=None, classify_strategy="fused"):
-    device = problem["q"].device
-    Q_NUM_BLOCKS = _round_up_to_multiple(SEQ_LEN, Q_BLOCK_SIZE) // Q_BLOCK_SIZE
-    KV_NUM_BLOCKS = _round_up_to_multiple(SEQ_LEN, KV_BLOCK_SIZE) // KV_BLOCK_SIZE
-    KV_LEN_PADDED = KV_NUM_BLOCKS * KV_BLOCK_SIZE
-
-    if stripe_q_blocks is None:
-        max_rows = max(1, _STRIPE_TARGET_BYTES // KV_LEN_PADDED)
-        stripe_q_blocks = max(1, max_rows // Q_BLOCK_SIZE)
-    stripe_q_blocks = min(stripe_q_blocks, Q_NUM_BLOCKS)
-
-    mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
-
-    max_stripe_height = stripe_q_blocks * Q_BLOCK_SIZE
-    stripe_buffer = torch.zeros(1, 1, max_stripe_height, KV_LEN_PADDED, dtype=torch.bool, device=device)
-
-    block_flags = torch.zeros((1, 1, Q_NUM_BLOCKS, KV_NUM_BLOCKS), device=device, dtype=torch.int8)
-    flags_stripe_buf = torch.empty((stripe_q_blocks, KV_NUM_BLOCKS), device=device, dtype=torch.int8)
-    partial_block_table = torch.full((Q_NUM_BLOCKS, KV_NUM_BLOCKS), -1, dtype=torch.int32, device=device)
-    global_B = torch.zeros(Q_NUM_BLOCKS, dtype=torch.int32, device=device)
-
-    # ========================================================================
-    # Single pass: generate mask + classify, then pack partial blocks immediately.
-    #
-    # classify_strategy="fused":     create_mask_kernel does STORE_MASK=True + CLASSIFY=True
-    #                                in one kernel launch (mask + flag computed together).
-    # classify_strategy="decoupled": create_mask_kernel does STORE_MASK=True + CLASSIFY=False
-    #                                (mask only), then block_classify_kernel reads mask from
-    #                                HBM to classify (separate kernel launch).
-    # ========================================================================
-    stripe_caches = []
-    stripe_meta = []
-    running_total = 0
-    
-    for qs_block in range(0, Q_NUM_BLOCKS, stripe_q_blocks):
-        qe_block = min(qs_block + stripe_q_blocks, Q_NUM_BLOCKS)
-        q_start = qs_block * Q_BLOCK_SIZE
-        q_height = (qe_block - qs_block) * Q_BLOCK_SIZE
-        stripe_q_nb = qe_block - qs_block
-
-        if qe_block >= Q_NUM_BLOCKS:
-            stripe_buffer.zero_()
-
-        if classify_strategy == "fused":
-            _run_create_mask_stripe(
-                problem, mask_type_str, q_start, q_height, KV_LEN_PADDED,
-                stripe_buffer, flags_stripe_buf, tile_size=MASK_BLOCK_SIZE
-            )
-        elif classify_strategy == "decoupled":
-            _run_create_mask_stripe(
-                problem, mask_type_str, q_start, q_height, KV_LEN_PADDED, stripe_buffer, tile_size=MASK_BLOCK_SIZE
-            )
-            _classify_stripe_from_hbm(
-                stripe_buffer, q_height, SEQ_LEN, flags_stripe_buf, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-            )
-        else:
-            raise ValueError(f"Unknown classify_strategy: {classify_strategy}")
-
-        block_flags[:, :, qs_block:qe_block, :] = flags_stripe_buf[:stripe_q_nb, :].unsqueeze(0).unsqueeze(0)
-
-        flags_stripe = flags_stripe_buf[:stripe_q_nb, :].contiguous()
-        A_stripe = (flags_stripe == 1).to(torch.int32).cumsum(dim=-1)
-        B_stripe = A_stripe.max(dim=-1).values
-        stripe_partial_count = int(B_stripe.sum().item())
-        global_B[qs_block:qe_block] = B_stripe.to(torch.int32)
-
-        if stripe_partial_count > 0:
-            stripe_cache = torch.zeros(
-                (stripe_partial_count, Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtype=torch.bool, device=device,
-            )
-            row_offset_local = (B_stripe.cumsum(dim=-1) - B_stripe).to(torch.int32).contiguous()
-            local_idx_stripe = A_stripe.contiguous()
-            table_stripe = partial_block_table[qs_block:qe_block, :]
-
-            pack_partial_blocks_kernel[(stripe_q_nb,)](
-                stripe_buffer, stripe_buffer.stride(0), stripe_buffer.stride(1), stripe_buffer.stride(2), stripe_buffer.stride(3),
-                flags_stripe, flags_stripe.stride(0), flags_stripe.stride(1),
-                row_offset_local, row_offset_local.stride(0),
-                local_idx_stripe, local_idx_stripe.stride(0), local_idx_stripe.stride(1),
-                stripe_cache, stripe_cache.stride(0), stripe_cache.stride(1), stripe_cache.stride(2),
-                table_stripe, table_stripe.stride(0), table_stripe.stride(1),
-                q_height, SEQ_LEN, Q_NUM_BLOCKS=stripe_q_nb, KV_NUM_BLOCKS=KV_NUM_BLOCKS, TOTAL_PARTIAL=stripe_partial_count,
-                Q_BLOCK_SIZE=Q_BLOCK_SIZE, KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            )
-            stripe_caches.append(stripe_cache)
-        else:
-            stripe_caches.append(
-                torch.zeros((0, Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtype=torch.bool, device=device)
-            )
-
-        stripe_meta.append((qs_block, qe_block, running_total))
-        running_total += stripe_partial_count
-
-    del stripe_buffer
-
-    total_partial = running_total
-
-    if total_partial > 0:
-        packed_partial_mask = torch.cat(stripe_caches, dim=0)
-        for qs_block_i, qe_block_i, cache_offset_i in stripe_meta:
-            if cache_offset_i > 0:
-                table_slice = partial_block_table[qs_block_i:qe_block_i, :]
-                valid = table_slice >= 0
-                if valid.any():
-                    table_slice[valid] += cache_offset_i
-    else:
-        packed_partial_mask = torch.zeros(
-            (0, Q_BLOCK_SIZE, KV_BLOCK_SIZE), dtype=torch.bool, device=device,
-        )
-
-    del stripe_caches
-
-    partial_mask_offsets_3d = (global_B.cumsum(dim=-1) - global_B).view(1, 1, Q_NUM_BLOCKS).contiguous()
-
-    partial_bm = (block_flags == 1).to(dtype=torch.int8)
-    full_bm = (block_flags == 2).to(dtype=torch.int8)
-    packed_block_mask = _create_sparse_block_from_block_mask(
-        (partial_bm, full_bm), 2, (SEQ_LEN, SEQ_LEN), Q_BLOCK_SIZE, KV_BLOCK_SIZE,
-    )
-    packed_block_mask.packed_partial_mask = packed_partial_mask
-    packed_block_mask.partial_mask_offsets = partial_mask_offsets_3d
-    packed_block_mask.partial_block_table = partial_block_table
-
-    del block_flags, global_B, partial_bm, full_bm
-    return packed_block_mask
 
 
 # ============================================================================
@@ -767,11 +330,19 @@ def test_flex_attention(mask_func):
     v_ref = v_base.detach().clone().requires_grad_(True)
 
     SEQ_LEN = problem["total_s"]
-    classify_strategy= "fused" if not is_910() else "decoupled"
-    packed_block_mask = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+
+    if GEN_MASK_TRITON:
+        classify_strategy= "fused" if not is_910() else "decoupled"
+        mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
+        packed_block_mask = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+    else:
+        packed_block_mask = create_block_mask_patched(
+            mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
+            device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+        )
     _sync()
 
-    return_grid = torch.tensor(520000, dtype=DTYPE, device=torch.device(_device()))
+    return_grid = torch.tensor(SEQ_LEN, dtype=DTYPE, device=torch.device(_device()))
 
     mojo_output = _flex_attention_mojo(q_mojo, k_mojo, v_mojo, None, packed_block_mask, 0.0, None)
     _sync()
@@ -881,7 +452,6 @@ def _perf_benchmark(label, build_mask_fn, fwd_fn, q, k, v, prof_dir_root, mask_f
             out.float().mean().backward(return_grid)
             _sync()
             prof.step()
-            del a,b,c
     print(f"======================== prof end ({label}) ====================")
 
     del out, mask
@@ -907,8 +477,16 @@ def _perf_flex_attention(mask_func, problem=None):
     torch.npu.empty_cache()
 
     def _build_packed_mask():
-        classify_strategy= "fused" if not is_910() else "decoupled"
-        pbm = _build_packed_block_mask_streaming(mask_func, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+        if GEN_MASK_TRITON:
+            classify_strategy= "fused" if not is_910() else "decoupled"
+            mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
+            pbm = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+        else:
+            pbm = create_block_mask_patched(
+                mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
+                device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+            )
+
         torch.npu.empty_cache()
         return pbm
 
