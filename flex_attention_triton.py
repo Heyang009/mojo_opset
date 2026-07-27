@@ -1550,6 +1550,317 @@ def reduce_dkdv_kernel(
         )
 
 
+# ===========================================================================
+# Fused qsplit dkdv kernel (single-stage, lock-based ordered accumulation)
+#
+# Replaces the two-stage (dkdv_qsplit + reduce_dkdv) pipeline.
+# - Direct tasks [0, SPLIT_START): single core per (z, hkv, kv_block, kv_sub),
+#   atomic_add directly to DK/DV (pre-zeroed).
+# - Split tasks [SPLIT_START, NUM_TASKS): K_SPLIT cores collaborate per KV
+#   block. Each core computes its Q-segment's dk/dv into a register accumulator
+#   (intra-core reduction over GQA heads + Q blocks), then acquires a per-
+#   (split_base_id, kv_sub) spinlock in sub_id order and atomic_adds its
+#   partial to DK/DV. Ordering guarantees deterministic accumulation
+#   DK = ((dk_0 + dk_1) + dk_2) + ..., matching the original reduce kernel.
+# - DK/DV are pre-zeroed externally; LOCKS buffer is pre-zeroed (one int32 per
+#   (split_base_id, kv_sub) slot, value encodes which sub_id holds the lock).
+# ===========================================================================
+@triton.jit(
+    do_not_specialize=[
+        "stride_mask_m",
+        "stride_partial_p", "stride_partial_m",
+        "stride_partial_table_m",
+        "stride_lse_z", "stride_lse_h", "stride_q_idx_m",
+        "Q_LEN", "KV_LEN", "NUM_TASKS", "NUM_KV_BLOCKS",
+        "stride_qz", "stride_qh",
+        "stride_kz", "stride_kh",
+        "stride_vz", "stride_vh",
+        "stride_doz", "stride_doh",
+        "stride_delta_z", "stride_delta_h",
+        "stride_dkz", "stride_dkh",
+        "stride_dvz", "stride_dvh",
+        "NUM_LOCKS",
+        "SPLIT_START",
+    ]
+)
+def flex_attention_backward_dkdv_kernel_qsplit_fused(
+    Q, K, V, DO, LSE, DELTA,
+    Q_NUM_BLKS, Q_IDX, FULL_Q_NUM_BLKS, FULL_Q_IDX,
+    DENSE_MASK, stride_mask_m, stride_mask_n,
+    PARTIAL_MASK_PACKED, PARTIAL_MASK_OFFSETS, PARTIAL_BLOCK_TABLE,
+    stride_partial_p, stride_partial_m, stride_partial_n,
+    stride_partial_offset_m, stride_partial_table_m, stride_partial_table_n,
+    # Final output buffers (pre-zeroed externally); replaces DK_PARTIAL/DV_PARTIAL
+    DK, DV,
+    # Spinlock buffer: one int32 per (split_base_id, kv_sub), pre-zeroed.
+    # LOCKS[slot] == sub_id  =>  sub_id holds the lock (initially 0 means sub_id=0)
+    LOCKS,
+    NUM_LOCKS,
+    stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+    stride_dvz, stride_dvh, stride_dvn, stride_dvk,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_doz, stride_doh, stride_dom, stride_dok,
+    stride_lse_z, stride_lse_h, stride_lse_m,
+    stride_delta_z, stride_delta_h, stride_delta_m,
+    stride_q_idx_m,
+    SM_SCALE: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SUB_BLOCKS: tl.constexpr,
+    NUM_TASKS,
+    NUM_KV_BLOCKS,
+    KV_HEAD,
+    SPARSE_Q_BLOCK_SIZE: tl.constexpr,
+    SPARSE_KV_BLOCK_SIZE: tl.constexpr,
+    Q_LEN,
+    KV_LEN,
+    GQA_SHARED_HEADS,
+    K_SPLIT: tl.constexpr,
+    SPLIT_START,
+    HAS_FULL_BLOCKS: tl.constexpr = True,
+    USE_PACKED_PARTIAL_MASK: tl.constexpr = False,
+):
+    pid = tl.program_id(0).to(tl.int32)
+    num_core = tl.num_programs(0).to(tl.int32)
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+    KV_BLOCK_SIZE: tl.constexpr = BLOCK_N * NUM_KV_SUB_BLOCKS
+
+    offs_k = tl.arange(0, QK_HEAD_DIM)
+    offs_v = tl.arange(0, V_HEAD_DIM)
+
+    sparse_q_multiple = SPARSE_Q_BLOCK_SIZE // BLOCK_M
+    sparse_kv_multiple = SPARSE_KV_BLOCK_SIZE // KV_BLOCK_SIZE
+
+    for task_id in range(pid, NUM_TASKS, num_core):
+        # ---- Task decomposition: direct vs split ----
+        # Direct tasks [0, SPLIT_START): process ALL Q blocks, atomic_add to DK/DV
+        # Split tasks [SPLIT_START, NUM_TASKS): process 1/K_SPLIT Q blocks,
+        #   acquire lock in sub_id order, then atomic_add to DK/DV
+        if task_id < SPLIT_START:
+            base_task = task_id
+            sub_id = 0
+            is_split = False
+        else:
+            split_task = task_id - SPLIT_START
+            sub_id = split_task % K_SPLIT
+            base_task = SPLIT_START + split_task // K_SPLIT
+            is_split = True
+
+        kv_start_block = base_task % NUM_KV_BLOCKS
+        off_z = (base_task // NUM_KV_BLOCKS) // KV_HEAD
+        off_hkv = (base_task // NUM_KV_BLOCKS) % KV_HEAD
+
+        off_z = off_z.to(tl.int64)
+        off_hkv = off_hkv.to(tl.int64)
+
+        k_offset = off_z * stride_kz + off_hkv * stride_kh
+        v_offset = off_z * stride_vz + off_hkv * stride_vh
+        dk_offset = off_z * stride_dkz + off_hkv * stride_dkh
+        dv_offset = off_z * stride_dvz + off_hkv * stride_dvh
+
+        K_ptr = K + k_offset
+        V_ptr = V + v_offset
+
+        start_n_full = kv_start_block * KV_BLOCK_SIZE
+
+        kv_sparse_idx = kv_start_block // sparse_kv_multiple
+        sparse_q_num_blks_offset = kv_sparse_idx
+        sparse_q_idx_offset = kv_sparse_idx * stride_q_idx_m
+
+        for kv_sub in range(NUM_KV_SUB_BLOCKS):
+            sub_offset = kv_sub * BLOCK_N
+            start_n = start_n_full + sub_offset
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < KV_LEN
+
+            k = tl.load(
+                K_ptr + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk,
+                mask=n_mask[:, None] & (offs_k[None, :] < QK_HEAD_DIM),
+                other=0.0,
+            )
+            v = tl.load(
+                V_ptr + offs_n[:, None] * stride_vn + offs_v[None, :] * stride_vk,
+                mask=n_mask[:, None] & (offs_v[None, :] < V_HEAD_DIM),
+                other=0.0,
+            )
+
+            # ---- Intra-core accumulators: aggregate GQA heads + Q blocks for this sub_id ----
+            dk_acc = tl.zeros([BLOCK_N, QK_HEAD_DIM], dtype=tl.float32)
+            dv_acc = tl.zeros([BLOCK_N, V_HEAD_DIM], dtype=tl.float32)
+
+            for off_g in range(0, GQA_SHARED_HEADS):
+                off_hq = off_hkv * GQA_SHARED_HEADS + off_g
+                off_hq = off_hq.to(tl.int64)
+
+                Q_h = Q + off_z * stride_qz + off_hq * stride_qh
+                DO_h = DO + off_z * stride_doz + off_hq * stride_doh
+                LSE_h = LSE + off_z * stride_lse_z + off_hq * stride_lse_h
+                DELTA_h = DELTA + off_z * stride_delta_z + off_hq * stride_delta_h
+
+                # ---- Partial Q-blocks (this sub-task's slice) ----
+                q_indices = Q_IDX + sparse_q_idx_offset
+                q_num_blocks = tl.load(Q_NUM_BLKS + sparse_q_num_blks_offset)
+                block_m_end_p = tl.minimum(
+                    q_num_blocks * sparse_q_multiple,
+                    tl.maximum(tl.cdiv(Q_LEN, BLOCK_M), 1, propagate_nan=True),
+                    propagate_nan=tl.PropagateNan.ALL,
+                )
+                if not is_split:
+                    q_start_p = 0
+                    q_end_p = block_m_end_p
+                else:
+                    q_start_p = sub_id * block_m_end_p // K_SPLIT
+                    q_end_p = (sub_id + 1) * block_m_end_p // K_SPLIT
+
+                for start_m in range(q_start_p, q_end_p):
+                    blk_idx_in_list = start_m // sparse_q_multiple
+                    q_block = tl.load(q_indices + blk_idx_in_list)
+                    q_start = q_block * SPARSE_Q_BLOCK_SIZE + (start_m % sparse_q_multiple) * BLOCK_M
+                    offs_m = q_start + tl.arange(0, BLOCK_M)
+                    q_sparse_idx = q_block
+
+                    # ===== Inlined bwd_dkdv_block_mn (partial branch), accumulate to dk_acc/dv_acc =====
+                    q = tl.load(
+                        Q_h + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
+                        mask=(offs_m[:, None] < Q_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+                        other=0.0,
+                    )
+                    do = tl.load(
+                        DO_h + offs_m[:, None] * stride_dom + offs_v[None, :] * stride_dok,
+                        mask=(offs_m[:, None] < Q_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+                        other=0.0,
+                    )
+                    lse = tl.load(LSE_h + offs_m, mask=offs_m < Q_LEN, other=float("-inf"))
+                    lse = tl.where(lse == float("-inf"), 0.0, lse)
+
+                    qk = tl.dot(q, tl.trans(k), input_precision="ieee")
+                    qk *= SM_SCALE
+
+                    if USE_PACKED_PARTIAL_MASK:
+                        partial_block_idx = tl.load(
+                            PARTIAL_BLOCK_TABLE
+                            + q_sparse_idx * stride_partial_table_m
+                            + kv_sparse_idx * stride_partial_table_n
+                        )
+                        safe_partial_block_idx = tl.maximum(partial_block_idx, 0)
+                        offs_m_in_block = (start_m % sparse_q_multiple) * BLOCK_M + tl.arange(0, BLOCK_M)
+                        offs_n_in_block = kv_sub * BLOCK_N + tl.arange(0, BLOCK_N)
+                        mask = load_packed_partial_mask(
+                            PARTIAL_MASK_PACKED,
+                            stride_partial_p, stride_partial_m, stride_partial_n,
+                            safe_partial_block_idx,
+                            offs_m_in_block, offs_n_in_block,
+                            SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
+                            SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
+                        )
+                        mask = mask & (partial_block_idx >= 0)
+                    else:
+                        mask = load_dense_mask(
+                            DENSE_MASK, stride_mask_m, stride_mask_n,
+                            offs_m, offs_n, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+                        )
+                    qk = tl.where(mask, qk, float("-inf"))
+
+                    p = tl.math.exp(qk - lse[:, None])
+
+                    dv_blk = tl.dot(tl.trans(p.to(MATMUL_PRECISION)), do, input_precision="ieee")
+                    dv_acc += dv_blk
+
+                    Di = tl.load(DELTA_h + offs_m, mask=offs_m < Q_LEN, other=0.0)
+                    dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+                    ds = (p * (dp - Di[:, None])) * SM_SCALE
+
+                    dk_blk = tl.dot(tl.trans(ds.to(MATMUL_PRECISION)), q, input_precision="ieee")
+                    dk_acc += dk_blk
+
+                # ---- Full Q-blocks (this sub-task's slice) ----
+                if HAS_FULL_BLOCKS:
+                    q_indices_f = FULL_Q_IDX + sparse_q_idx_offset
+                    q_num_blocks_f = tl.load(FULL_Q_NUM_BLKS + sparse_q_num_blks_offset)
+                    block_m_end_f = tl.minimum(
+                        q_num_blocks_f * sparse_q_multiple,
+                        tl.maximum(tl.cdiv(Q_LEN, BLOCK_M), 1, propagate_nan=True),
+                        propagate_nan=tl.PropagateNan.ALL,
+                    )
+                    if not is_split:
+                        q_start_f = 0
+                        q_end_f = block_m_end_f
+                    else:
+                        q_start_f = sub_id * block_m_end_f // K_SPLIT
+                        q_end_f = (sub_id + 1) * block_m_end_f // K_SPLIT
+
+                    for start_m in range(q_start_f, q_end_f):
+                        blk_idx_in_list = start_m // sparse_q_multiple
+                        q_block = tl.load(q_indices_f + blk_idx_in_list)
+                        q_start = q_block * SPARSE_Q_BLOCK_SIZE + (start_m % sparse_q_multiple) * BLOCK_M
+                        offs_m = q_start + tl.arange(0, BLOCK_M)
+                        q_sparse_idx = q_block
+
+                        # ===== Inlined bwd_dkdv_block_mn (full branch, no mask) =====
+                        q = tl.load(
+                            Q_h + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
+                            mask=(offs_m[:, None] < Q_LEN) & (offs_k[None, :] < QK_HEAD_DIM),
+                            other=0.0,
+                        )
+                        do = tl.load(
+                            DO_h + offs_m[:, None] * stride_dom + offs_v[None, :] * stride_dok,
+                            mask=(offs_m[:, None] < Q_LEN) & (offs_v[None, :] < V_HEAD_DIM),
+                            other=0.0,
+                        )
+                        lse = tl.load(LSE_h + offs_m, mask=offs_m < Q_LEN, other=float("-inf"))
+                        lse = tl.where(lse == float("-inf"), 0.0, lse)
+
+                        qk = tl.dot(q, tl.trans(k), input_precision="ieee")
+                        qk *= SM_SCALE
+                        p = tl.math.exp(qk - lse[:, None])
+
+                        dv_blk = tl.dot(tl.trans(p.to(MATMUL_PRECISION)), do, input_precision="ieee")
+                        dv_acc += dv_blk
+
+                        Di = tl.load(DELTA_h + offs_m, mask=offs_m < Q_LEN, other=0.0)
+                        dp = tl.dot(do, tl.trans(v), input_precision="ieee")
+                        ds = (p * (dp - Di[:, None])) * SM_SCALE
+
+                        dk_blk = tl.dot(tl.trans(ds.to(MATMUL_PRECISION)), q, input_precision="ieee")
+                        dk_acc += dk_blk
+
+            # ==================== Writeback stage ====================
+            dk_ptr = DK + dk_offset + offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk
+            dv_ptr = DV + dv_offset + offs_n[:, None] * stride_dvn + offs_v[None, :] * stride_dvk
+            store_mask_dk = n_mask[:, None] & (offs_k[None, :] < QK_HEAD_DIM)
+            store_mask_dv = n_mask[:, None] & (offs_v[None, :] < V_HEAD_DIM)
+
+            if not is_split:
+                # ---- Direct task: single core owns this (z, hkv, kv_block, kv_sub) ----
+                # DK/DV pre-zeroed, atomic_add is equivalent to store.
+                tl.atomic_add(dk_ptr, dk_acc, mask=store_mask_dk)
+                tl.atomic_add(dv_ptr, dv_acc, mask=store_mask_dv)
+            else:
+                # ---- Split task: spinlock-ordered accumulation ----
+                # One lock per (split_base_id, kv_sub). LOCKS[slot] == sub_id means
+                # it's sub_id's turn. Initial 0 => sub_id=0 goes first.
+                split_base_id = base_task - SPLIT_START
+                my_idx = split_base_id * NUM_KV_SUB_BLOCKS + kv_sub
+                LOCK_ptr = LOCKS + my_idx
+
+                # Spin-wait until it's my turn (atomic_load provides acquire semantics)
+                while tl.atomic_load(LOCK_ptr) != sub_id:
+                    pass
+
+                # Critical section: atomic_add my partial (DK/DV pre-zeroed, no
+                # load+add+store branch needed)
+                tl.atomic_add(dk_ptr, dk_acc, mask=store_mask_dk)
+                tl.atomic_add(dv_ptr, dv_acc, mask=store_mask_dv)
+
+                # Release lock: advance turn to next sub_id (wraps to 0 after last)
+                tl.atomic_xchg(LOCK_ptr, (sub_id + 1) % K_SPLIT)
+
+
 @triton.jit(
     do_not_specialize=[
         "stride_mask_m",
@@ -2473,25 +2784,27 @@ class FlexAttentionFunc(torch.autograd.Function):
                     enable_ub_refine_opt=True,
                 )
 
-                # ---- 2. dkdv kernel (qsplit) ----
+                # ---- 2. dkdv kernel (qsplit fused: lock-based ordered accumulation) ----
+                # Replaces two-stage (dkdv_qsplit + reduce_dkdv) with single fused kernel.
+                # DK/DV are pre-zeroed (outer scope); split tasks use spinlock to
+                # accumulate in sub_id order, deterministic with original reduce kernel.
                 K_SPLIT = ctx.qsplit_k
                 SPLIT_START = ctx.qsplit_start
 
                 if K_SPLIT > 1:
-                    dk_partial = torch.zeros(
-                        (K_SPLIT, Z, Hkv, N, D), dtype=torch.float32, device=k.device,
-                    )
-                    dv_partial = torch.zeros(
-                        (K_SPLIT, Z, Hkv, N, Dv), dtype=torch.float32, device=v.device,
-                    )
-                    dk = dk_partial[0]
-                    dv = dv_partial[0]
-
+                    # dk/dv are already zeroed in outer scope (line ~2654)
                     total_base = num_kv_blocks * Z * Hkv
-                    num_tasks_dkv = SPLIT_START + (total_base - SPLIT_START) * K_SPLIT
+                    num_split_base = total_base - SPLIT_START
+
+                    # Spinlock buffer: one int32 per (split_base_id, kv_sub), pre-zeroed.
+                    # LOCKS[slot] == sub_id means it's sub_id's turn (initial 0 => sub_id=0 first).
+                    num_locks = num_split_base * NUM_KV_SUB_BLOCKS_VAL
+                    locks = torch.zeros(num_locks, dtype=torch.int32, device=k.device)
+
+                    num_tasks_dkv = SPLIT_START + num_split_base * K_SPLIT
                     grid_dkv, _ = _persistent_launch_config(num_tasks_dkv)
-                    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>dkdv>>>>>>>>>{grid_dkv=},{num_tasks_dkv=}, K_SPLIT={K_SPLIT}, SPLIT_START={SPLIT_START}, total_base={total_base}")
-                    flex_attention_backward_dkdv_kernel_qsplit[grid_dkv](
+                    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>dkdv_fused>>>>>>>>>{grid_dkv=},{num_tasks_dkv=}, K_SPLIT={K_SPLIT}, SPLIT_START={SPLIT_START}, total_base={total_base}, num_locks={num_locks}")
+                    flex_attention_backward_dkdv_kernel_qsplit_fused[grid_dkv](
                         q, k, v, grad_output, lse, delta,
                         q_num_blks, q_idx, full_q_num_blks, full_q_idx,
                         dense_mask, dense_mask.stride(2), dense_mask.stride(3),
@@ -2499,8 +2812,9 @@ class FlexAttentionFunc(torch.autograd.Function):
                         packed_partial_mask.stride(0), packed_partial_mask.stride(1), packed_partial_mask.stride(2),
                         partial_mask_offsets.stride(2),
                         partial_block_table.stride(0), partial_block_table.stride(1),
-                        dk_partial, dv_partial,
-                        dk_partial.stride(0), dv_partial.stride(0),
+                        dk, dv,
+                        locks,
+                        num_locks,
                         dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
                         dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
                         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -2534,29 +2848,7 @@ class FlexAttentionFunc(torch.autograd.Function):
                         intra_cache_num=2,
                         inter_cache_num=1,
                     )
-
-                    # Reduce dkdv: only for split KV blocks
-                    BLOCK_N_REDUCE = 64
-                    NUM_N_TILES_PER_KV = ctx.sparse_kv_block_size // BLOCK_N_REDUCE
-                    num_split_base = total_base - SPLIT_START
-                    num_reduce_tasks = num_split_base * NUM_N_TILES_PER_KV
-                    grid_reduce, _ = _persistent_launch_config(num_reduce_tasks)
-                    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>reduce_dkdv_kernel>>>>>>>>>{grid_reduce=},{num_reduce_tasks=}, split_base={num_split_base}")
-                    reduce_dkdv_kernel[grid_reduce](
-                        dk, dv,
-                        dk_partial, dv_partial,
-                        dk_partial.stride(0), dv_partial.stride(0),
-                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                        num_reduce_tasks, N, SPLIT_START, num_kv_blocks,
-                        KV_HEAD=Hkv,
-                        K=K_SPLIT,
-                        BLOCK_N=BLOCK_N_REDUCE,
-                        SPARSE_KV_BLOCK_SIZE=ctx.sparse_kv_block_size,
-                        NUM_N_TILES_PER_KV=NUM_N_TILES_PER_KV,
-                        QK_HEAD_DIM=D,
-                        V_HEAD_DIM=Dv,
-                    )
+                    # reduce_dkdv_kernel is no longer needed: accumulation is fused.
 
                 else:
                     grid_dkv, num_tasks_dkv = _persistent_launch_config(num_kv_blocks * Z * Hkv)
