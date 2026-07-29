@@ -2056,8 +2056,9 @@ def flex_attention_bwd_impl(
         # ================================================================
 
         # ---- Step 1: 构建任务列表 ----
+        # w_sparse 形状为 [Z, H, num_kv_sparse], 装箱算法按 1D kv_sparse_idx 索引, 故展平
         work_items_t, task_offsets_t, split_bases_t, max_sub = _build_task_list(
-            w_sparse, Hkv, num_kv_blocks, sparse_kv_multiple, target, num_core, k.device,
+            w_sparse.reshape(-1), Hkv, num_kv_blocks, sparse_kv_multiple, target, num_core, k.device,
         )
         num_meta = num_core                             # meta-task 数 = 核数
         num_split_base = split_bases_t.shape[0]
