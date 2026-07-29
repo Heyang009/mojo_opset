@@ -1976,10 +1976,16 @@ def flex_attention_bwd_impl(
     #   w_sparse[kv_sparse_idx] = q_num_blks + full_q_num_blks
     #   base task = (hkv, kv_block), 重量 = w_sparse[kv_block // sparse_kv_multiple]
     #
-    # 不均衡判定 (任一成立即走 task-list 路径):
-    #   ① total_base 不能整除核数 (尾轮不满核)
-    #   ② max_w / mean_w > 阈值 (KV 分块间 Q-block 计算量长尾)
-    # 否则走原始 SIMPLE kernel (零额外开销, 性能最优)
+    # 仅在以下两种场景才进入 task-list 路径 (否则走零开销的 SIMPLE kernel):
+    #
+    # 场景一 — 尾块浪费显著 (total_base 不能整除核数):
+    #   满轮数 full_rounds = total_base // num_core <= MAX_FULL_ROUNDS, 且
+    #   尾轮核占比 tail_ratio = (total_base % num_core) / num_core < TAIL_RATIO_THRESHOLD
+    #   (轮数少 + 尾轮空闲核多 → 尾块浪费占总工作比例大, 值得装箱均衡)
+    #
+    # 场景二 — 重量长尾 (total_base 能整除核数, 无尾块问题):
+    #   max_w / mean_w > IMB_THRESHOLD, 各 KV 分块 Q-block 数差异大
+    #   (任务数虽均衡但实际计算量不均衡, 需 split 重任务)
     # ========================================================================
     total_base = num_kv_blocks * Z * Hkv
     num_core = _get_num_aicore()
@@ -1993,10 +1999,28 @@ def flex_attention_bwd_impl(
     max_w = w_sparse.max().item()
     target = total_w / num_core                       # 单核目标重量
 
-    IMB_THRESHOLD = 1.5                               # 长尾判定阈值
-    use_tasklist = (total_base % num_core != 0) or (
-        mean_w > 0 and max_w / mean_w > IMB_THRESHOLD
+    # ---- 分支判定阈值 ----
+    IMB_THRESHOLD = 1.5                               # 重量长尾判定阈值
+    TAIL_RATIO_THRESHOLD = 0.5                        # 尾轮核占比阈值
+    MAX_FULL_ROUNDS = 2                               # 尾块判定的最大满轮数
+
+    full_rounds = total_base // num_core
+    tail_cores = total_base % num_core
+    tail_ratio = tail_cores / num_core
+
+    # 场景一: 尾块浪费显著 (不能整除 + 满轮数少 + 尾轮核占比低)
+    has_significant_tail = (
+        tail_cores > 0
+        and full_rounds <= MAX_FULL_ROUNDS
+        and tail_ratio < TAIL_RATIO_THRESHOLD
     )
+    # 场景二: 重量长尾 (能整除, 无尾块问题, 但 KV 分块间计算量差异大)
+    has_weight_imbalance = (
+        tail_cores == 0
+        and mean_w > 0
+        and max_w / mean_w > IMB_THRESHOLD
+    )
+    use_tasklist = has_significant_tail or has_weight_imbalance
 
     if not use_tasklist:
         # ================================================================
