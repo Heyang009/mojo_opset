@@ -10,6 +10,25 @@ from mojo_opset.tests.utils import bypass_not_implemented
 from mojo_opset.backends.ttx.kernels import sdpa_fwd, sdpa_bwd
 
 
+def seed_all(seed=1234):
+    import random
+    import os
+    import numpy as np
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['HCCL_DETERMINISTIC'] = str(True)
+    os.environ['LCCL_DETERMINISTIC'] = str(1)
+    os.environ['CLOSE_MATMUL_K_SHIFT'] = str(1)
+    os.environ['ATB_MATMUL_SHUFFLE_K_ENABLE'] = "0"
+    os.environ['ATB_LLM_LCOC_ENABLE'] = "0"
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True)
+
+    torch_npu.npu.manual_seed_all(seed)
+    torch_npu.npu.manual_seed(seed)
+
+
 def generate_diffusion_attention_mask(seq_length, block_size):
     total_length = seq_length * 2
     i = torch.arange(total_length).unsqueeze(1)
@@ -132,6 +151,7 @@ def sdpa_npu_bwd_ref(q, k, v, do, mask, scale, enable_gqa):
 @auto_switch_platform(set_perf=True)
 @bypass_not_implemented
 def test_sdpa_impl(bsz, q_head_num, kv_head_num, head_dim, seq_length, block_size):
+    seed_all() # required for deterministic algorithms of torch_npu
     enable_gqa = q_head_num != kv_head_num
     scale = 1.0 / math.sqrt(head_dim)
 
@@ -215,9 +235,9 @@ def test_sdpa_impl(bsz, q_head_num, kv_head_num, head_dim, seq_length, block_siz
 
     dq_npu, dk_npu, dv_npu = sdpa_npu_bwd_ref(query, key, value, do, mask, scale, enable_gqa)
 
-    dq_diff_npu = (dq.cpu().to(torch.float32) - dq_npu.cpu().to(torch.float32)).abs()
-    dk_diff_npu = (dk.cpu().to(torch.float32) - dk_npu.cpu().to(torch.float32)).abs()
-    dv_diff_npu = (dv.cpu().to(torch.float32) - dv_npu.cpu().to(torch.float32)).abs()
+    dq_diff_npu = (dq_ref.cpu().to(torch.float32) - dq_npu.cpu().to(torch.float32)).abs()
+    dk_diff_npu = (dk_ref.cpu().to(torch.float32) - dk_npu.cpu().to(torch.float32)).abs()
+    dv_diff_npu = (dv_ref.cpu().to(torch.float32) - dv_npu.cpu().to(torch.float32)).abs()
     print(f"\n[Backward vs torch_npu]")
     print(f"  dq max_abs_diff={dq_diff_npu.max().item():.6f}  mean_abs_diff={dq_diff_npu.mean().item():.6f}")
     print(f"  dk max_abs_diff={dk_diff_npu.max().item():.6f}  mean_abs_diff={dk_diff_npu.mean().item():.6f}")
