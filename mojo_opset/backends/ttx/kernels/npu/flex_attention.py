@@ -1800,6 +1800,135 @@ def flex_attention_fwd_impl(
 # 互斥保证: 一个 kv_block 要么整体 direct (w<=target), 要么整体 split (w>target),
 #           两者不混存, 故 split 的 kv_block 的 DK/DV 地址仅由 reduce 写入, 覆盖安全。
 # ============================================================================
+# 装箱策略: 每个 core 的 work-item 组装逻辑
+#
+# 所有策略函数签名一致:
+#   def _bin_pack_xxx(work_items_list, num_core, target, TOL) -> bins
+# 输入:
+#   work_items_list: [(hkv, kv_block, sub_id, K, is_split, w), ...]
+#   num_core:        bin 数 (= 核数)
+#   target:          单核目标重量
+#   TOL:             装箱容忍 (bin_w + wi <= target*TOL)
+# 输出:
+#   bins: List[List[work_item]], 每个内层 list 对应一个 core 的串行执行序列
+#
+# 选择策略: 通过 _build_task_list(pack_strategy=...) 传入字符串键。
+# ============================================================================
+
+def _first_fit_into_bins(ordered_items, num_core, target, TOL):
+    """通用 first-fit 装箱: 按 ordered_items 顺序依次放入第一个容得下的 bin。
+
+    装不下时放入当前最轻的 bin (保证 bin 数 = num_core, 不溢出)。
+    不同策略只需改变 ordered_items 的顺序即可复用本函数。
+    """
+    bins = [[] for _ in range(num_core)]
+    bin_w = [0.0] * num_core
+    for wi in ordered_items:
+        w = wi[5]
+        placed = False
+        for b in range(num_core):
+            if bin_w[b] + w <= target * TOL:
+                bins[b].append(wi)
+                bin_w[b] += w
+                placed = True
+                break
+        if not placed:
+            lightest = bin_w.index(min(bin_w))
+            bins[lightest].append(wi)
+            bin_w[lightest] += w
+    return bins
+
+
+def _bin_pack_ffd_weight(work_items_list, num_core, target, TOL):
+    """策略 1 (默认): 纯重量降序 first-fit (FFD)。
+
+    全局按重量降序后 first-fit, 不考虑 hkv 局部性。
+    均衡性最优, 但同一 core 的 hkv 频繁跳变, K/V 缓存命中差。
+    """
+    ordered = sorted(work_items_list, key=lambda t: t[5], reverse=True)
+    return _first_fit_into_bins(ordered, num_core, target, TOL)
+
+
+def _bin_pack_ffd_hkv_aware_sort(work_items_list, num_core, target, TOL):
+    """策略 2 (方案 C): hkv 感知排序 + first-fit。
+
+    主键 hkv 升序, 次键重量降序。同一 hkv 的重任务连续装入,
+    让多个 core 并行处理同一 hkv 的一批任务, 再切下一个 hkv。
+    改动最小, hkv 切换次数从 O(num_work) 降到 O(Hkv)。
+    """
+    ordered = sorted(work_items_list, key=lambda t: (t[0], -t[5]))
+    return _first_fit_into_bins(ordered, num_core, target, TOL)
+
+
+def _bin_pack_ffd_hkv_grouped(work_items_list, num_core, target, TOL):
+    """策略 3 (方案 A): hkv 分组 + 组内降序 first-fit。
+
+    按 hkv 分组, 组内按重量降序, 逐 hkv 轮转 first-fit。
+    所有 core 先并行处理 hkv=0 的一批任务, 再处理 hkv=1, ...
+    hkv 局部性最好且负载均衡不退化 (仍是 first-fit + 兜底)。
+    """
+    bins = [[] for _ in range(num_core)]
+    bin_w = [0.0] * num_core
+
+    # 按 hkv 分组
+    groups = {}
+    for wi in work_items_list:
+        groups.setdefault(wi[0], []).append(wi)
+
+    # 逐 hkv 处理, 组内按重量降序
+    for hkv in sorted(groups.keys()):
+        group = sorted(groups[hkv], key=lambda t: t[5], reverse=True)
+        for wi in group:
+            w = wi[5]
+            placed = False
+            for b in range(num_core):
+                if bin_w[b] + w <= target * TOL:
+                    bins[b].append(wi)
+                    bin_w[b] += w
+                    placed = True
+                    break
+            if not placed:
+                lightest = bin_w.index(min(bin_w))
+                bins[lightest].append(wi)
+                bin_w[lightest] += w
+    return bins
+
+
+def _bin_pack_hkv_continuous(work_items_list, num_core, target, TOL):
+    """策略 4 (方案 B): hkv 分块连续装箱。
+
+    每个 core 连续处理完一个 hkv 的所有 work-item 再切下一个 hkv。
+    缓存命中最高 (同 hkv 内 K/V 驻留 cache), 但若某 hkv 重量特别重,
+    处理它的 core 可能成为长尾。仅适用于 hkv 间重量相对均衡的场景。
+    """
+    bins = [[] for _ in range(num_core)]
+    bin_w = [0.0] * num_core
+
+    # 按 hkv 分组, 组内按重量降序
+    groups = {}
+    for wi in work_items_list:
+        groups.setdefault(wi[0], []).append(wi)
+
+    for hkv in sorted(groups.keys()):
+        group = sorted(groups[hkv], key=lambda t: t[5], reverse=True)
+        # 组内: 每个 work-item 放入当前最轻的 bin, 让同 hkv 任务尽量集中
+        for wi in group:
+            w = wi[5]
+            lightest = bin_w.index(min(bin_w))
+            bins[lightest].append(wi)
+            bin_w[lightest] += w
+    return bins
+
+
+# 策略注册表: 字符串键 -> 装箱函数
+_BIN_PACK_STRATEGIES = {
+    "ffd_weight":           _bin_pack_ffd_weight,
+    "ffd_hkv_aware_sort":   _bin_pack_ffd_hkv_aware_sort,
+    "ffd_hkv_grouped":      _bin_pack_ffd_hkv_grouped,
+    "hkv_continuous":       _bin_pack_hkv_continuous,
+}
+
+
 def _build_task_list(
     w_sparse: torch.Tensor,   # [num_kv_sparse], 每个 kv_sparse_idx 的有效 Q-block 数
     Hkv: int,
@@ -1808,8 +1937,16 @@ def _build_task_list(
     target: float,            # 单核目标重量
     num_core: int,            # 核数
     device,
+    pack_strategy: str = "ffd_weight",   # 装箱策略键, 见 _BIN_PACK_STRATEGIES
 ):
     """构建 task list (merge + split 统一装箱)。
+
+    Args:
+        pack_strategy: 装箱策略, 可选:
+            - "ffd_weight":           纯重量降序 first-fit (默认, 向后兼容)
+            - "ffd_hkv_aware_sort":   hkv 感知排序 + first-fit (方案 C)
+            - "ffd_hkv_grouped":      hkv 分组 + 组内降序 first-fit (方案 A)
+            - "hkv_continuous":       hkv 分块连续装箱 (方案 B)
 
     Returns:
         work_items_t:   [num_work, 5] int32, (hkv, kv_block, sub_id, K, is_split)
@@ -1842,26 +1979,16 @@ def _build_task_list(
                     work_items_list.append((hkv, kv_block, sub, K, 1, per_sub_w))
 
     # ================================================================
-    # 阶段 B: 降序 first-fit 装入 num_core 个 bin
+    # 阶段 B: 按选定策略装入 num_core 个 bin
     # ================================================================
-    work_items_list.sort(key=lambda t: t[5], reverse=True)   # 按重量降序
-    bins = [[] for _ in range(num_core)]                     # num_core 个 bin
-    bin_w = [0.0] * num_core
-    TOL = 1.0                                                 # 装箱容忍: bin_w + wi <= target*TOL
-
-    for wi in work_items_list:
-        placed = False
-        for b in range(num_core):
-            if bin_w[b] + wi[5] <= target * TOL:
-                bins[b].append(wi)
-                bin_w[b] += wi[5]
-                placed = True
-                break
-        if not placed:
-            # 所有 bin 都装不下, 放到当前最轻的 bin (保证 bin 数 = num_core)
-            lightest = bin_w.index(min(bin_w))
-            bins[lightest].append(wi)
-            bin_w[lightest] += wi[5]
+    TOL = 1.0   # 装箱容忍: bin_w + wi <= target*TOL
+    pack_fn = _BIN_PACK_STRATEGIES.get(pack_strategy)
+    if pack_fn is None:
+        raise ValueError(
+            f"Unknown pack_strategy: {pack_strategy!r}, "
+            f"expected one of {list(_BIN_PACK_STRATEGIES.keys())}"
+        )
+    bins = pack_fn(work_items_list, num_core, target, TOL)
 
     # ================================================================
     # 组装 CSR: work_items_final[j] = (hkv, kv_block, sub_id, K, is_split)
@@ -1899,6 +2026,7 @@ def flex_attention_bwd_impl(
     lse: torch.Tensor,
     block_mask,
     sm_scale: Optional[float] = None,
+    pack_strategy: str = "ffd_weight",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     Z, Hq, M, D = q.shape
     _, Hkv, N, Dv = k.shape
@@ -2083,6 +2211,7 @@ def flex_attention_bwd_impl(
         # w_sparse 形状为 [Z, H, num_kv_sparse], 装箱算法按 1D kv_sparse_idx 索引, 故展平
         work_items_t, task_offsets_t, split_bases_t, max_sub = _build_task_list(
             w_sparse.reshape(-1), Hkv, num_kv_blocks, sparse_kv_multiple, target, num_core, k.device,
+            pack_strategy=pack_strategy,
         )
         num_meta = num_core                             # meta-task 数 = 核数
         num_split_base = split_bases_t.shape[0]
