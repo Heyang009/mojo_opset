@@ -2,7 +2,7 @@ from typing import Optional
 from typing import Tuple
 
 import torch
-
+import time
 import triton
 import triton.language as tl
 
@@ -958,231 +958,6 @@ def _bwd_dkdv_qblock_range(
 
 
 # ===========================================================================
-# Q-split dkdv kernel: 将尾部 KV-block task 沿 Q-block 轴拆分为 K_SPLIT 份并行执行。
-#
-# Direct task [0, SPLIT_START): 处理全部 Q-blocks，直接写入 DK_PARTIAL[0] / DV_PARTIAL[0]
-#   （与 dk/dv 共享视图，无需额外 reduce）。
-# Split  task [SPLIT_START, NUM_TASKS): 处理 1/K_SPLIT 的 Q-blocks，
-#   写入 DK_PARTIAL[sub_id] / DV_PARTIAL[sub_id]（按 sub_id 隔离，无竞争）。
-#
-# 每个 (kv_block, sub_id) task 运行在唯一核上，GQA heads 串行执行，
-# 不同 task 写入互不重叠的内存，因此结果确定。
-# 后续由 reduce_dkdv_kernel 对 split KV block 求和合并 partial 梯度。
-# ===========================================================================
-@triton.jit(
-    do_not_specialize=[
-        "stride_mask_m",
-        "stride_partial_p", "stride_partial_m",
-        "stride_partial_table_m",
-        "stride_lse_z", "stride_lse_h", "stride_q_idx_m",
-        "Q_LEN", "KV_LEN", "NUM_TASKS", "NUM_KV_BLOCKS",
-        "stride_qz", "stride_qh",
-        "stride_kz", "stride_kh",
-        "stride_vz", "stride_vh",
-        "stride_doz", "stride_doh",
-        "stride_delta_z", "stride_delta_h",
-        "stride_dkz", "stride_dkh",
-        "stride_dvz", "stride_dvh",
-        "stride_dkp_k", "stride_dvp_k",
-        "SPLIT_START",
-    ]
-)
-def flex_attention_backward_dkdv_kernel_qsplit(
-    Q, K, V, DO, LSE, DELTA,
-    Q_NUM_BLKS, Q_IDX, FULL_Q_NUM_BLKS, FULL_Q_IDX,
-    DENSE_MASK, stride_mask_m, stride_mask_n,
-    PARTIAL_MASK_PACKED, PARTIAL_MASK_OFFSETS, PARTIAL_BLOCK_TABLE,
-    stride_partial_p, stride_partial_m, stride_partial_n,
-    stride_partial_offset_m, stride_partial_table_m, stride_partial_table_n,
-    DK_PARTIAL, DV_PARTIAL,
-    stride_dkp_k, stride_dvp_k,
-    stride_dkz, stride_dkh, stride_dkn, stride_dkk,
-    stride_dvz, stride_dvh, stride_dvn, stride_dvk,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_doz, stride_doh, stride_dom, stride_dok,
-    stride_lse_z, stride_lse_h, stride_lse_m,
-    stride_delta_z, stride_delta_h, stride_delta_m,
-    stride_q_idx_m,
-    SM_SCALE: tl.constexpr,
-    QK_HEAD_DIM: tl.constexpr,
-    V_HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    NUM_KV_SUB_BLOCKS: tl.constexpr,
-    NUM_TASKS,
-    NUM_KV_BLOCKS,
-    KV_HEAD,
-    SPARSE_Q_BLOCK_SIZE: tl.constexpr,
-    SPARSE_KV_BLOCK_SIZE: tl.constexpr,
-    Q_LEN,
-    KV_LEN,
-    GQA_SHARED_HEADS,
-    K_SPLIT: tl.constexpr,
-    SPLIT_START,
-    HAS_FULL_BLOCKS: tl.constexpr = True,
-    USE_PACKED_PARTIAL_MASK: tl.constexpr = False,
-):
-    pid = tl.program_id(0).to(tl.int32)
-    num_core = tl.num_programs(0).to(tl.int32)
-
-    MATMUL_PRECISION = Q.dtype.element_ty
-    KV_BLOCK_SIZE: tl.constexpr = BLOCK_N * NUM_KV_SUB_BLOCKS
-
-    offs_k = tl.arange(0, QK_HEAD_DIM)
-    offs_v = tl.arange(0, V_HEAD_DIM)
-
-    # constexpr 除法，提升至 kernel 级避免每个 task 重复计算
-    sparse_q_multiple = SPARSE_Q_BLOCK_SIZE // BLOCK_M
-    sparse_kv_multiple = SPARSE_KV_BLOCK_SIZE // KV_BLOCK_SIZE
-
-    for task_id in range(pid, NUM_TASKS, num_core):
-        # ---- 任务分解: direct vs split ----
-        # Direct [0, SPLIT_START): 处理全部 Q-blocks，直接写入 DK/DV
-        # Split  [SPLIT_START, NUM_TASKS): 处理 1/K_SPLIT 的 Q-blocks，
-        #   写入 DK_PARTIAL[sub_id] / DV_PARTIAL[sub_id]（按 sub_id 隔离，无竞争）
-        is_direct = task_id < SPLIT_START
-        if is_direct:
-            base_task = task_id
-            sub_id = 0
-        else:
-            split_task = task_id - SPLIT_START
-            sub_id = split_task % K_SPLIT
-            base_task = SPLIT_START + split_task // K_SPLIT
-
-        kv_start_block = base_task % NUM_KV_BLOCKS
-        off_z = ((base_task // NUM_KV_BLOCKS) // KV_HEAD).to(tl.int64)
-        off_hkv = ((base_task // NUM_KV_BLOCKS) % KV_HEAD).to(tl.int64)
-
-        k_offset = off_z * stride_kz + off_hkv * stride_kh
-        v_offset = off_z * stride_vz + off_hkv * stride_vh
-        dk_offset = off_z * stride_dkz + off_hkv * stride_dkh
-        dv_offset = off_z * stride_dvz + off_hkv * stride_dvh
-
-        K_ptr = K + k_offset
-        V_ptr = V + v_offset
-
-        # 输出指针: DK_PARTIAL[sub_id, z, hkv, ...] — 各 sub_id 写入互不重叠。
-        # 注意: dk_partial[0] 与 dk 共享视图，因此 direct 任务 (sub_id=0) 直接写入 dk。
-        DK_OUT_ptr = DK_PARTIAL + sub_id * stride_dkp_k + dk_offset
-        DV_OUT_ptr = DV_PARTIAL + sub_id * stride_dvp_k + dv_offset
-
-        start_n_full = kv_start_block * KV_BLOCK_SIZE
-
-        kv_sparse_idx = kv_start_block // sparse_kv_multiple
-        sparse_q_idx_offset = kv_sparse_idx * stride_q_idx_m
-
-        # ---- 计算 Q-block 迭代范围 (提升至 task 级: 不依赖 kv_sub 和 head) ----
-        # Partial Q-blocks
-        q_indices = Q_IDX + sparse_q_idx_offset
-        q_num_blocks = tl.load(Q_NUM_BLKS + kv_sparse_idx)
-        block_m_end_p = tl.minimum(
-            q_num_blocks * sparse_q_multiple,
-            tl.maximum(tl.cdiv(Q_LEN, BLOCK_M), 1, propagate_nan=True),
-            propagate_nan=tl.PropagateNan.ALL,
-        )
-        if is_direct:
-            q_start_p = 0
-            q_end_p = block_m_end_p
-        else:
-            q_start_p = sub_id * block_m_end_p // K_SPLIT
-            q_end_p = (sub_id + 1) * block_m_end_p // K_SPLIT
-
-        # Full Q-blocks (仅当 HAS_FULL_BLOCKS 时加载，否则范围为空)
-        q_start_f = 0
-        q_end_f = 0
-        q_indices_f = q_indices  # dummy; 仅 HAS_FULL_BLOCKS 时使用
-        if HAS_FULL_BLOCKS:
-            q_indices_f = FULL_Q_IDX + sparse_q_idx_offset
-            q_num_blocks_f = tl.load(FULL_Q_NUM_BLKS + kv_sparse_idx)
-            block_m_end_f = tl.minimum(
-                q_num_blocks_f * sparse_q_multiple,
-                tl.maximum(tl.cdiv(Q_LEN, BLOCK_M), 1, propagate_nan=True),
-                propagate_nan=tl.PropagateNan.ALL,
-            )
-            if is_direct:
-                q_start_f = 0
-                q_end_f = block_m_end_f
-            else:
-                q_start_f = sub_id * block_m_end_f // K_SPLIT
-                q_end_f = (sub_id + 1) * block_m_end_f // K_SPLIT
-
-        for kv_sub in range(NUM_KV_SUB_BLOCKS):
-            start_n = start_n_full + kv_sub * BLOCK_N
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            n_mask = offs_n < KV_LEN
-
-            k = tl.load(
-                K_ptr + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk,
-                mask=n_mask[:, None] & (offs_k[None, :] < QK_HEAD_DIM),
-                other=0.0,
-            )
-            v = tl.load(
-                V_ptr + offs_n[:, None] * stride_vn + offs_v[None, :] * stride_vk,
-                mask=n_mask[:, None] & (offs_v[None, :] < V_HEAD_DIM),
-                other=0.0,
-            )
-
-            for off_g in range(0, GQA_SHARED_HEADS):
-                off_hq = (off_hkv * GQA_SHARED_HEADS + off_g).to(tl.int64)
-
-                Q_h = Q + off_z * stride_qz + off_hq * stride_qh
-                DO_h = DO + off_z * stride_doz + off_hq * stride_doh
-                LSE_h = LSE + off_z * stride_lse_z + off_hq * stride_lse_h
-                DELTA_h = DELTA + off_z * stride_delta_z + off_hq * stride_delta_h
-
-                # ---- Partial Q-blocks (当前 sub-task 的切片) ----
-                _bwd_dkdv_qblock_range(
-                    Q_h, DO_h, DK_OUT_ptr, DELTA_h, LSE_h, DV_OUT_ptr,
-                    DENSE_MASK, stride_mask_m, stride_mask_n,
-                    PARTIAL_MASK_PACKED, stride_partial_p, stride_partial_m, stride_partial_n,
-                    PARTIAL_BLOCK_TABLE, stride_partial_table_m, stride_partial_table_n,
-                    k, v, Q_LEN, KV_LEN,
-                    off_z, off_hq, off_hkv, offs_n, offs_k, offs_v,
-                    q_indices, q_start_p, q_end_p,
-                    kv_sparse_idx, kv_sub,
-                    stride_qm, stride_qk, stride_dom, stride_dok,
-                    stride_dvn, stride_dvk, stride_dkn, stride_dkk,
-                    MATMUL_PRECISION,
-                    SM_SCALE=SM_SCALE,
-                    SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
-                    SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
-                    QK_HEAD_DIM=QK_HEAD_DIM,
-                    V_HEAD_DIM=V_HEAD_DIM,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
-                    IS_FULL_BLOCKS=False,
-                    USE_PACKED_PARTIAL_MASK=USE_PACKED_PARTIAL_MASK,
-                )
-
-                # ---- Full Q-blocks (当前 sub-task 的切片) ----
-                if HAS_FULL_BLOCKS:
-                    _bwd_dkdv_qblock_range(
-                        Q_h, DO_h, DK_OUT_ptr, DELTA_h, LSE_h, DV_OUT_ptr,
-                        DENSE_MASK, stride_mask_m, stride_mask_n,
-                        PARTIAL_MASK_PACKED, stride_partial_p, stride_partial_m, stride_partial_n,
-                        PARTIAL_BLOCK_TABLE, stride_partial_table_m, stride_partial_table_n,
-                        k, v, Q_LEN, KV_LEN,
-                        off_z, off_hq, off_hkv, offs_n, offs_k, offs_v,
-                        q_indices_f, q_start_f, q_end_f,
-                        kv_sparse_idx, kv_sub,
-                        stride_qm, stride_qk, stride_dom, stride_dok,
-                        stride_dvn, stride_dvk, stride_dkn, stride_dkk,
-                        MATMUL_PRECISION,
-                        SM_SCALE=SM_SCALE,
-                        SPARSE_Q_BLOCK_SIZE=SPARSE_Q_BLOCK_SIZE,
-                        SPARSE_KV_BLOCK_SIZE=SPARSE_KV_BLOCK_SIZE,
-                        QK_HEAD_DIM=QK_HEAD_DIM,
-                        V_HEAD_DIM=V_HEAD_DIM,
-                        BLOCK_M=BLOCK_M,
-                        BLOCK_N=BLOCK_N,
-                        IS_FULL_BLOCKS=True,
-                        USE_PACKED_PARTIAL_MASK=USE_PACKED_PARTIAL_MASK,
-                    )
-
-
-# ===========================================================================
 # Task-list dkdv kernel: 基于 host 侧装箱结果的自适应负载均衡 kernel。
 #
 # 设计动机:
@@ -1800,19 +1575,11 @@ def flex_attention_fwd_impl(
 # 互斥保证: 一个 kv_block 要么整体 direct (w<=target), 要么整体 split (w>target),
 #           两者不混存, 故 split 的 kv_block 的 DK/DV 地址仅由 reduce 写入, 覆盖安全。
 # ============================================================================
-# 装箱策略: 每个 core 的 work-item 组装逻辑
+# 装箱策略: hkv 分块连续装箱 (唯一策略)
 #
-# 所有策略函数签名一致:
-#   def _bin_pack_xxx(work_items_list, num_core, target, TOL) -> bins
-# 输入:
-#   work_items_list: [(hkv, kv_block, sub_id, K, is_split, w), ...]
-#   num_core:        bin 数 (= 核数)
-#   target:          单核目标重量
-#   TOL:             装箱容忍 (bin_w + wi <= target*TOL)
-# 输出:
-#   bins: List[List[work_item]], 每个内层 list 对应一个 core 的串行执行序列
-#
-# 选择策略: 通过 _build_task_list(pack_strategy=...) 传入字符串键。
+# 每个 core 连续处理完一个 hkv 的所有 work-item 再切下一个 hkv,
+# 缓存命中最高 (同 hkv 内 K/V 驻留 cache)。组内按重量降序,
+# 每个 work-item 放入当前最轻的 bin, 保证负载均衡。
 # ============================================================================
 
 def _first_fit_into_bins(ordered_items, num_core, target, TOL):
@@ -1839,67 +1606,21 @@ def _first_fit_into_bins(ordered_items, num_core, target, TOL):
     return bins
 
 
-def _bin_pack_ffd_weight(work_items_list, num_core, target, TOL):
-    """策略 1 (默认): 纯重量降序 first-fit (FFD)。
-
-    全局按重量降序后 first-fit, 不考虑 hkv 局部性。
-    均衡性最优, 但同一 core 的 hkv 频繁跳变, K/V 缓存命中差。
-    """
-    ordered = sorted(work_items_list, key=lambda t: t[5], reverse=True)
-    return _first_fit_into_bins(ordered, num_core, target, TOL)
-
-
-def _bin_pack_ffd_hkv_aware_sort(work_items_list, num_core, target, TOL):
-    """策略 2 (方案 C): hkv 感知排序 + first-fit。
-
-    主键 hkv 升序, 次键重量降序。同一 hkv 的重任务连续装入,
-    让多个 core 并行处理同一 hkv 的一批任务, 再切下一个 hkv。
-    改动最小, hkv 切换次数从 O(num_work) 降到 O(Hkv)。
-    """
-    ordered = sorted(work_items_list, key=lambda t: (t[0], -t[5]))
-    return _first_fit_into_bins(ordered, num_core, target, TOL)
-
-
-def _bin_pack_ffd_hkv_grouped(work_items_list, num_core, target, TOL):
-    """策略 3 (方案 A): hkv 分组 + 组内降序 first-fit。
-
-    按 hkv 分组, 组内按重量降序, 逐 hkv 轮转 first-fit。
-    所有 core 先并行处理 hkv=0 的一批任务, 再处理 hkv=1, ...
-    hkv 局部性最好且负载均衡不退化 (仍是 first-fit + 兜底)。
-    """
-    bins = [[] for _ in range(num_core)]
-    bin_w = [0.0] * num_core
-
-    # 按 hkv 分组
-    groups = {}
-    for wi in work_items_list:
-        groups.setdefault(wi[0], []).append(wi)
-
-    # 逐 hkv 处理, 组内按重量降序
-    for hkv in sorted(groups.keys()):
-        group = sorted(groups[hkv], key=lambda t: t[5], reverse=True)
-        for wi in group:
-            w = wi[5]
-            placed = False
-            for b in range(num_core):
-                if bin_w[b] + w <= target * TOL:
-                    bins[b].append(wi)
-                    bin_w[b] += w
-                    placed = True
-                    break
-            if not placed:
-                lightest = bin_w.index(min(bin_w))
-                bins[lightest].append(wi)
-                bin_w[lightest] += w
-    return bins
-
-
 def _bin_pack_hkv_continuous(work_items_list, num_core, target, TOL):
-    """策略 4 (方案 B): hkv 分块连续装箱。
+    """hkv 分块连续装箱。
 
-    每个 core 连续处理完一个 hkv 的所有 work-item 再切下一个 hkv。
-    缓存命中最高 (同 hkv 内 K/V 驻留 cache), 但若某 hkv 重量特别重,
-    处理它的 core 可能成为长尾。仅适用于 hkv 间重量相对均衡的场景。
+    每个 core 连续处理完一个 hkv 的所有 work-item 再切下一个 hkv,
+    缓存命中最高 (同 hkv 内 K/V 驻留 cache)。组内按重量降序,
+    每个 work-item 放入当前最轻的 bin, 保证负载均衡。
+
+    Args:
+        work_items_list: [(hkv, kv_block, sub_id, K, is_split, w), ...]
+        num_core: bin 数 (= 核数)
+        target: 单核目标重量
+        TOL: 装箱容忍 (bin_w + wi <= target*TOL)
+
+    Returns:
+        bins: List[List[work_item]], 每个 core 的串行执行序列
     """
     bins = [[] for _ in range(num_core)]
     bin_w = [0.0] * num_core
@@ -1920,15 +1641,6 @@ def _bin_pack_hkv_continuous(work_items_list, num_core, target, TOL):
     return bins
 
 
-# 策略注册表: 字符串键 -> 装箱函数
-_BIN_PACK_STRATEGIES = {
-    "ffd_weight":           _bin_pack_ffd_weight,
-    "ffd_hkv_aware_sort":   _bin_pack_ffd_hkv_aware_sort,
-    "ffd_hkv_grouped":      _bin_pack_ffd_hkv_grouped,
-    "hkv_continuous":       _bin_pack_hkv_continuous,
-}
-
-
 def _build_task_list(
     w_sparse: torch.Tensor,   # [num_kv_sparse], 每个 kv_sparse_idx 的有效 Q-block 数
     Hkv: int,
@@ -1937,16 +1649,10 @@ def _build_task_list(
     target: float,            # 单核目标重量
     num_core: int,            # 核数
     device,
-    pack_strategy: str = "ffd_weight",   # 装箱策略键, 见 _BIN_PACK_STRATEGIES
 ):
     """构建 task list (merge + split 统一装箱)。
 
-    Args:
-        pack_strategy: 装箱策略, 可选:
-            - "ffd_weight":           纯重量降序 first-fit (默认, 向后兼容)
-            - "ffd_hkv_aware_sort":   hkv 感知排序 + first-fit (方案 C)
-            - "ffd_hkv_grouped":      hkv 分组 + 组内降序 first-fit (方案 A)
-            - "hkv_continuous":       hkv 分块连续装箱 (方案 B)
+    装箱策略固定为 hkv 分块连续装箱 (_bin_pack_hkv_continuous)。
 
     Returns:
         work_items_t:   [num_work, 5] int32, (hkv, kv_block, sub_id, K, is_split)
@@ -1956,39 +1662,64 @@ def _build_task_list(
     """
     # ================================================================
     # 阶段 A: 生成所有 work-item
+    #
+    # 性能优化要点:
+    #   1. 原实现在 Hkv * num_kv_blocks 内层循环中逐次调用
+    #      w_sparse[...].item(), 每次触发一次 NPU->CPU 同步 (约 11 us/次),
+    #      是该函数 >95% 耗时的根源。改为一次性 .tolist() 将整张小张量
+    #      同步到 Python 列表, 把 Hkv*num_kv_blocks 次同步降为 1 次。
+    #
+    #   2. 每个 kv_block 的重量 w 仅依赖 kv_block // sparse_kv_multiple,
+    #      与 hkv 完全无关。先构建 hkv=0 的模板 (template), 再按 hkv
+    #      批量复制, 避免在 Hkv 重循环中重复执行分支判断与 ceil 除法。
+    #      复制后 work_items_list / split_bases_list 的元素顺序与原实现
+    #      严格一致 (hkv 外层升序, kv_block 内层升序)。
     # ================================================================
-    work_items_list = []   # [(hkv, kv_block, sub_id, K, is_split, w), ...]
-    split_bases_list = []  # [(hkv, kv_block, K), ...]
+    w_sparse_list = w_sparse.tolist()
+    target_int = int(target)
+
+    # 预计算每个 kv_block 的重量 (与 hkv 无关, 只算一次)
+    w_per_kv_block = [
+        w_sparse_list[kv_block // sparse_kv_multiple]
+        for kv_block in range(num_kv_blocks)
+    ]
+
+    # 构建 hkv=0 的模板: (kv_block, sub_id, K, is_split, w)
+    template_items = []
+    template_split_bases = []
     max_sub = 1
 
+    for kv_block in range(num_kv_blocks):
+        w = w_per_kv_block[kv_block]
+        if w == 0:
+            continue
+        if w <= target:
+            # direct: 整块, K=1
+            template_items.append((kv_block, 0, 1, 0, float(w)))
+        else:
+            # split: 拆 K 份
+            K = (w + target_int - 1) // target_int   # ceil(w/target)
+            template_split_bases.append((kv_block, K))
+            if K > max_sub:
+                max_sub = K
+            per_sub_w = w / K
+            for sub in range(K):
+                template_items.append((kv_block, sub, K, 1, per_sub_w))
+
+    # 按 hkv 复制模板, 生成完整 work_items_list / split_bases_list
+    work_items_list = []   # [(hkv, kv_block, sub_id, K, is_split, w), ...]
+    split_bases_list = []  # [(hkv, kv_block, K), ...]
     for hkv in range(Hkv):
-        for kv_block in range(num_kv_blocks):
-            w = int(w_sparse[kv_block // sparse_kv_multiple].item())
-            if w == 0:
-                continue
-            if w <= target:
-                # direct: 整块, K=1
-                work_items_list.append((hkv, kv_block, 0, 1, 0, float(w)))
-            else:
-                # split: 拆 K 份
-                K = (w + int(target) - 1) // int(target)   # ceil(w/target)
-                split_bases_list.append((hkv, kv_block, K))
-                max_sub = max(max_sub, K)
-                per_sub_w = w / K
-                for sub in range(K):
-                    work_items_list.append((hkv, kv_block, sub, K, 1, per_sub_w))
+        for kv_block, sub_id, K_val, is_split, w in template_items:
+            work_items_list.append((hkv, kv_block, sub_id, K_val, is_split, w))
+        for kv_block, K_val in template_split_bases:
+            split_bases_list.append((hkv, kv_block, K_val))
 
     # ================================================================
-    # 阶段 B: 按选定策略装入 num_core 个 bin
+    # 阶段 B: hkv 分块连续装箱, 装入 num_core 个 bin
     # ================================================================
     TOL = 1.0   # 装箱容忍: bin_w + wi <= target*TOL
-    pack_fn = _BIN_PACK_STRATEGIES.get(pack_strategy)
-    if pack_fn is None:
-        raise ValueError(
-            f"Unknown pack_strategy: {pack_strategy!r}, "
-            f"expected one of {list(_BIN_PACK_STRATEGIES.keys())}"
-        )
-    bins = pack_fn(work_items_list, num_core, target, TOL)
+    bins = _bin_pack_hkv_continuous(work_items_list, num_core, target, TOL)
 
     # ================================================================
     # 组装 CSR: work_items_final[j] = (hkv, kv_block, sub_id, K, is_split)
@@ -2017,6 +1748,61 @@ def _build_task_list(
     return work_items_t, task_offsets_t, split_bases_t, max_sub
 
 
+def _compute_and_cache_task_list(
+    block_mask,
+    w_sparse: torch.Tensor,
+    Hkv: int,
+    num_kv_blocks: int,
+    sparse_kv_multiple: int,
+    target: float,
+    num_core: int,
+    device,
+    sparse_kv_block_size: int,
+):
+    """构建 bwd task list 并缓存到 block_mask 上 (延迟缓存)。
+
+    task list 仅依赖 block_mask 的 q_num_blocks/full_q_num_blocks 以及 Hkv、
+    SPARSE_KV_BLOCK_SIZE, 与具体 q/k/v 数据无关。首次 bwd 调用时计算并缓存,
+    同一 mask 的后续 bwd 调用直接复用, 避免重复装箱。
+
+    调用前提: bwd 侧 use_tasklist 判定已保证 sparse_kv_block_size == TILE_BLOCK_SIZE,
+    故本函数无条件缓存。
+
+    Args:
+        block_mask: BlockMask 对象, 计算结果缓存到其 task_list_* 属性上。
+        w_sparse: [num_kv_sparse] 每个 kv_sparse_idx 的有效 Q-block 数。
+        Hkv: KV head 数。
+        num_kv_blocks: KV block 总数。
+        sparse_kv_multiple: kv_block -> kv_sparse_idx 的换算因子。
+        target: 单核目标重量。
+        num_core: 核数。
+        device: 张量分配设备。
+        sparse_kv_block_size: 当前执行的 SPARSE_KV_BLOCK_SIZE (校验/缓存用)。
+
+    Returns:
+        work_items_t:   [num_work, 5] int32, (hkv, kv_block, sub_id, K, is_split)
+        task_offsets_t: [num_meta+1] int32, CSR 偏移
+        split_bases_t:  [num_split_base, 3] int32, (hkv, kv_block, K)
+        max_sub:        int, partial buffer 第 0 维大小
+    """
+    start_time = time.perf_counter()
+    work_items_t, task_offsets_t, split_bases_t, max_sub = _build_task_list(
+        w_sparse.reshape(-1), Hkv, num_kv_blocks, sparse_kv_multiple,
+        target, num_core, device,
+    )
+    end_time = time.perf_counter()
+
+    # 缓存到 block_mask (进入 tasklist 分支时 SPARSE_KV_BLOCK_SIZE == TILE_BLOCK_SIZE 已保证)
+    block_mask.task_list_work_items = work_items_t
+    block_mask.task_list_offsets = task_offsets_t
+    block_mask.task_list_split_bases = split_bases_t
+    block_mask.task_list_max_sub = max_sub
+    block_mask.task_list_sparse_kv_block_size = sparse_kv_block_size
+    block_mask.task_list_num_kv_heads = Hkv
+
+    return work_items_t, task_offsets_t, split_bases_t, max_sub
+
+
 def flex_attention_bwd_impl(
     grad_output: torch.Tensor,
     q: torch.Tensor,
@@ -2026,7 +1812,6 @@ def flex_attention_bwd_impl(
     lse: torch.Tensor,
     block_mask,
     sm_scale: Optional[float] = None,
-    pack_strategy: str = "ffd_weight",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     Z, Hq, M, D = q.shape
     _, Hkv, N, Dv = k.shape
@@ -2149,6 +1934,9 @@ def flex_attention_bwd_impl(
         and max_w / mean_w > IMB_THRESHOLD
     )
     use_tasklist = has_significant_tail or has_weight_imbalance
+    # tasklist 路径的装箱参数仅在 SPARSE_KV_BLOCK_SIZE == TILE_BLOCK_SIZE 时有效,
+    # 不满足时直接走 SIMPLE kernel 分支 (零额外开销)
+    use_tasklist = use_tasklist and (SPARSE_KV_BLOCK_SIZE == TILE_BLOCK_SIZE)
 
     if not use_tasklist:
         # ================================================================
@@ -2207,12 +1995,37 @@ def flex_attention_bwd_impl(
         # Step 3: launch reduce kernel (仅对 split base task 合并 partial)
         # ================================================================
 
-        # ---- Step 1: 构建任务列表 ----
-        # w_sparse 形状为 [Z, H, num_kv_sparse], 装箱算法按 1D kv_sparse_idx 索引, 故展平
-        work_items_t, task_offsets_t, split_bases_t, max_sub = _build_task_list(
-            w_sparse.reshape(-1), Hkv, num_kv_blocks, sparse_kv_multiple, target, num_core, k.device,
-            pack_strategy=pack_strategy,
+        # ---- Step 1: 获取任务列表 (延迟缓存: 首次计算并缓存, 后续复用) ----
+        #
+        # task list 仅依赖 block_mask 的 q_num_blocks/full_q_num_blocks 以及 Hkv、
+        # SPARSE_KV_BLOCK_SIZE, 与具体 q/k/v 数据无关。因此首次 bwd 调用时计算,
+        # 缓存到 block_mask 上, 同一 mask 的后续 bwd 调用直接复用, 避免重复装箱。
+        #
+        # 合法性拦截 (全部满足才复用缓存, 否则重新计算并刷新缓存):
+        #   1. block_mask 上存在 task_list 缓存 (首次调用后写入)
+        #   2. 缓存时的 SPARSE_KV_BLOCK_SIZE == 当前执行的 SPARSE_KV_BLOCK_SIZE
+        #   3. 缓存时的 Hkv == 当前 Hkv
+        #   (SPARSE_KV_BLOCK_SIZE == TILE_BLOCK_SIZE 已在 use_tasklist 判定时保证)
+        cached_sparse_kv_bs = getattr(block_mask, "task_list_sparse_kv_block_size", None)
+        cached_hkv = getattr(block_mask, "task_list_num_kv_heads", None)
+        has_valid_cache = (
+            cached_sparse_kv_bs is not None
+            and cached_sparse_kv_bs == SPARSE_KV_BLOCK_SIZE
+            and cached_hkv == Hkv
         )
+
+        if has_valid_cache:
+            work_items_t = block_mask.task_list_work_items
+            task_offsets_t = block_mask.task_list_offsets
+            split_bases_t = block_mask.task_list_split_bases
+            max_sub = block_mask.task_list_max_sub
+        else:
+            # 首次调用或参数不匹配: 构建任务列表并缓存到 block_mask
+            work_items_t, task_offsets_t, split_bases_t, max_sub = _compute_and_cache_task_list(
+                block_mask, w_sparse, Hkv, num_kv_blocks, sparse_kv_multiple,
+                target, num_core, k.device, SPARSE_KV_BLOCK_SIZE,
+            )
+
         num_meta = num_core                             # meta-task 数 = 核数
         num_split_base = split_bases_t.shape[0]
 
