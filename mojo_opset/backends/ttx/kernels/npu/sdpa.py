@@ -616,8 +616,8 @@ def kernel_sdpa_bwd_q(
             block_mask = tl.load(ptr_mask, mask=mask_mask, other=False)
 
             block_s = tl.dot(block_q, block_k.T) * scale
-            block_s -= (1.0 - block_mask.to(HIGH_TYPE)) * 1e6
             block_p = tl.exp(block_s - block_lse[:, None])
+            block_p = tl.where(block_mask, block_p, 0.0)
             block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
             block_ds = block_p * (block_dp - block_d[:, None]) * scale
             block_dq += tl.dot(block_ds.to(LOW_TYPE), block_k).to(HIGH_TYPE)
@@ -766,8 +766,8 @@ def kernel_sdpa_bwd_kv(
                 block_mask = tl.load(ptr_mask, mask=mask_mask, other=False)
 
                 block_s = tl.dot(block_q, block_k.T) * scale
-                block_s -= (1.0 - block_mask.to(HIGH_TYPE)) * 1e6
                 block_p = tl.exp(block_s - block_lse[:, None])
+                block_p = tl.where(block_mask, block_p, 0.0)
                 block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
                 block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
                 block_ds = block_p * (block_dp - block_d[:, None]) * scale
@@ -948,6 +948,217 @@ def sdpa_fwd_impl(
     return o, lse
 
 
+
+@triton.autotune(
+    configs=[
+        triton.Config({"multibuffer": False, "BLOCK_R": 128, "BLOCK_C": 128}),
+    ],
+    key=["N", "S", "H"],
+    reset_to_zero=["dq", "dk", "dv"],
+)
+@triton.jit
+def kernel_sdpa_bwd_qkv(
+    q,
+    k,
+    v,
+    do,
+    d,
+    dq,
+    dk,
+    dv,
+    lse,
+    mask,
+    scale: tl.constexpr,
+    num_group: tl.constexpr,
+    B: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    H: tl.constexpr,
+    STRIDE_Q_B: tl.constexpr,
+    STRIDE_Q_N: tl.constexpr,
+    STRIDE_Q_S: tl.constexpr,
+    STRIDE_Q_H: tl.constexpr,
+    STRIDE_K_B: tl.constexpr,
+    STRIDE_K_N: tl.constexpr,
+    STRIDE_K_S: tl.constexpr,
+    STRIDE_K_H: tl.constexpr,
+    STRIDE_V_B: tl.constexpr,
+    STRIDE_V_N: tl.constexpr,
+    STRIDE_V_S: tl.constexpr,
+    STRIDE_V_H: tl.constexpr,
+    STRIDE_D_B: tl.constexpr,
+    STRIDE_D_N: tl.constexpr,
+    STRIDE_D_S: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    n_programs = tl.num_programs(axis=0)
+    num_r = tl.cdiv(S, BLOCK_R)
+    group_size = N // num_group
+    group_num = N // group_size
+    idx_h = tl.arange(0, H)
+    start_id = pid % 2
+    for idx_br in range(pid // 2 , B * num_r * N, n_programs // 2):
+        idx_b = idx_br // num_r // N
+        idx_r = idx_br // N % num_r
+        idx_n = idx_br % N
+        tasks = num_r
+        ptr_dq = (
+                dq
+                + idx_b * STRIDE_Q_B
+                + idx_n * STRIDE_Q_N
+                + (idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S
+                + idx_h[None, :] * STRIDE_Q_H
+        )
+        dq_mask = (idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] < S
+
+        q_block_ptr = tl.make_block_ptr(
+            base=q + idx_b * STRIDE_Q_B + idx_n * STRIDE_Q_N,
+            shape=(S, H),
+            strides=(STRIDE_Q_S, STRIDE_Q_H),
+            offsets=((idx_r * BLOCK_R).to(tl.int32), 0),
+            block_shape=(BLOCK_R, H),
+            order=(1, 0),
+        )
+        block_q = tl.load(q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        do_block_ptr = tl.make_block_ptr(
+            base=do + idx_b * STRIDE_Q_B + idx_n * STRIDE_Q_N,
+            shape=(S, H),
+            strides=(STRIDE_Q_S, STRIDE_Q_H),
+            offsets=((idx_r * BLOCK_R).to(tl.int32), 0),
+            block_shape=(BLOCK_R, H),
+            order=(1, 0),
+        )
+        block_do = tl.load(do_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        block_dq = tl.zeros((BLOCK_R, H), dtype=tl.float32)
+        for idx_c in range(start_id, tasks, 2):
+            idx_group = idx_n // group_size
+
+            k_block_ptr = tl.make_block_ptr(
+                base=k + idx_b * STRIDE_K_B + idx_group * STRIDE_K_N,
+                shape=(S, H),
+                strides=(STRIDE_K_S, STRIDE_K_H),
+                offsets=((idx_c * BLOCK_C).to(tl.int32), 0),
+                block_shape=(BLOCK_C, H),
+                order=(1, 0),
+            )
+
+            v_block_ptr = tl.make_block_ptr(
+                base=v + idx_b * STRIDE_V_B + idx_group * STRIDE_V_N,
+                shape=(S, H),
+                strides=(STRIDE_V_S, STRIDE_V_H),
+                offsets=((idx_c * BLOCK_C).to(tl.int32), 0),
+                block_shape=(BLOCK_C, H),
+                order=(1, 0),
+            )
+
+            q_offs = idx_r * BLOCK_R + tl.arange(0, BLOCK_R)
+            mask_d = q_offs < S
+            ptr_d = d + idx_b * STRIDE_D_B + idx_n * STRIDE_D_N + q_offs * STRIDE_D_S
+            ptr_lse = lse + idx_b * STRIDE_D_B + idx_n * STRIDE_D_N + q_offs * STRIDE_D_S
+            block_d = tl.load(ptr_d, mask=mask_d, other=0.0)
+            block_lse = tl.load(ptr_lse, mask=mask_d, other=0.0)
+
+            ptr_mask = (
+                mask
+                + (idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * S
+                + (idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[None, :]
+            )
+            mask_mask = ((idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] < S) & (
+                (idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[None, :] < S
+            )
+            block_mask = tl.load(ptr_mask, mask=mask_mask, other=False)
+
+
+            ptr_dk = (
+                dk
+                + pid // 2 * STRIDE_K_B * B
+                + idx_b * STRIDE_K_B
+                + idx_group * STRIDE_K_N
+                + (idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_K_S
+                + idx_h[None, :] * STRIDE_K_H
+            )
+            dk_mask = (idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] < S
+
+            ptr_dv = (
+                dv
+                + pid // 2 * STRIDE_K_B * B
+                + idx_b * STRIDE_V_B
+                + idx_group * STRIDE_V_N
+                + (idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_V_S
+                + idx_h[None, :] * STRIDE_V_H
+            )
+
+            block_k = tl.load(k_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            k_T = tl.trans(block_k)
+            qk = tl.dot(block_q, k_T)
+            qk = qk * scale
+            p = tl.math.exp(qk - block_lse[:, None])
+
+            p = tl.where(block_mask, p, 0.0)
+            # dv
+            block_dv = tl.dot(tl.trans(p.to(block_k.dtype)), block_do)
+            tl.atomic_add(ptr_dv, block_dv, mask=dk_mask)
+            # dp
+            block_v = tl.load(v_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            v_T = tl.trans(block_v)
+            dp = tl.dot(block_do, v_T)
+            # ds
+            ds = p * (dp - block_d[:, None]) * scale
+            ds_cast = ds.to(block_q.dtype)
+
+            # dk
+            block_dk = tl.dot(tl.trans(ds_cast), block_q)
+            tl.atomic_add(ptr_dk, block_dk, dk_mask)
+
+            # dq
+            block_dq = tl.dot(ds_cast, block_k, block_dq)
+            # tl.atomic_add(ptr_dq, block_dq.to(ptr_dq.dtype.element_ty), dq_mask)
+
+        tl.atomic_add(ptr_dq, block_dq, mask=dq_mask)
+        # tl.store(ptr_dq, block_dq.to(ptr_dq.dtype.element_ty), mask=dq_mask)
+
+
+_BWD_ATOMIC_PRESSURE_THRESHOLD = 256
+
+
+def _select_bwd_branch(seq_len, q_head_num, kv_head_num, block_r=128):
+    """
+    Return True for the fused (QKV) kernel, False for the split (Q + KV) kernels.
+    Two backward strategies exist:
+
+      "fused"  – kernel_sdpa_bwd_qkv computes dq, dk, dv in a single kernel.
+                 dq is accumulated locally and written once; dk/dv must use
+                 atomic_add into a per-core workspace (later reduced with sum).
+
+      "split"  – kernel_sdpa_bwd_q (dq) + kernel_sdpa_bwd_kv (dk, dv).
+                 Each kernel picks its own optimal parallelisation dimension,
+                 so NO atomics and NO workspace are needed, but the "front-end"
+                 work (Q@K^T, softmax, do@V^T) is computed twice.
+
+    The dominant cost driver of the fused path is the number of atomic_add
+    writes that land on each KV-block:
+
+        atomic_pressure = num_r * group_size
+                        = (seq_len / BLOCK_R) * (q_head_num / kv_head_num)
+
+    When atomic_pressure is small the fused kernel wins because it avoids the
+    redundant front-end computation.  When atomic_pressure is large the
+    atomic + workspace + reduction overhead explodes and the split kernels win.
+
+    The threshold below was calibrated on Ascend NPU.  Use force_branch in the
+    benchmark script to sweep shapes and refine it.
+
+    """
+    num_r = (seq_len + block_r - 1) // block_r
+    group_size = q_head_num // kv_head_num
+    atomic_pressure = num_r * group_size
+    return atomic_pressure < _BWD_ATOMIC_PRESSURE_THRESHOLD
+
+
 def sdpa_bwd_impl(
     o: torch.Tensor,
     do: torch.Tensor,
@@ -958,6 +1169,7 @@ def sdpa_bwd_impl(
     mask: torch.Tensor = None,
     scale: float = 1.0,
     gqa_enabled: bool = False,
+    force_branch: Optional[str] = None,
 ):
     """
     Backward computation interface:
@@ -989,9 +1201,7 @@ def sdpa_bwd_impl(
 
     num_cores, num_vec_cores = get_device_properties()
     d = torch.empty_like(lse)
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dq = torch.zeros_like(q)
 
     kernel_sdpa_bwd_d[(num_vec_cores,)](
         o,
@@ -1009,79 +1219,140 @@ def sdpa_bwd_impl(
         d.stride(1),
         d.stride(2),
     )
-    kernel_sdpa_bwd_q[(num_cores,)](
-        q,
-        k,
-        v,
-        do,
-        d,
-        dq,
-        lse,
-        mask,
-        scale,
-        k.shape[1],
-        q.shape[0],
-        q.shape[1],
-        q.shape[2],
-        q.shape[3],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        d.stride(0),
-        d.stride(1),
-        d.stride(2),
-        limit_auto_multi_buffer_buffer="no-limit",
-        hfusion_enable_multiple_consumer_fusion=True,
-        unit_flag=True,
-        limit_auto_multi_buffer_of_local_buffer="no-l0c",
-        intra_cache_num=1,
-    )
-    kernel_sdpa_bwd_kv[(num_cores,)](
-        q,
-        k,
-        v,
-        do,
-        d,
-        dk,
-        dv,
-        lse,
-        mask,
-        scale,
-        k.shape[1],
-        q.shape[0],
-        q.shape[1],
-        q.shape[2],
-        q.shape[3],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        d.stride(0),
-        d.stride(1),
-        d.stride(2),
-        limit_auto_multi_buffer_buffer="no-limit",
-        hfusion_enable_multiple_consumer_fusion=True,
-        unit_flag=True,
-        limit_auto_multi_buffer_of_local_buffer="no-l0c",
-        intra_cache_num=3,
-        inter_cache_num=2,
-    )
 
-    return dq, dk, dv
+    # -- Select backward strategy -------------------------------------------
+    # force_branch: "fused" | "split" | None (auto-select via heuristic)
+    if force_branch is not None:
+        use_fused = force_branch == "fused"
+    else:
+        use_fused = _select_bwd_branch(q.shape[2], q.shape[1], k.shape[1])
+
+    if use_fused:
+        bsz, kv_head, seq_len, head_dim = k.shape
+        # Per-core workspace for dk/dv to reduce atomic_add conflicts.
+        # The fused kernel indexes this dimension with (pid // 2), so we
+        # need (num_cores + 1) // 2 slots.
+        num_workspace = (num_cores + 1) // 2
+        core_dk = torch.zeros((num_workspace, bsz, kv_head, seq_len, head_dim), dtype=torch.float32, device=k.device)
+        core_dv = torch.zeros((num_workspace, bsz, kv_head, seq_len, head_dim), dtype=torch.float32, device=v.device)
+        kernel_sdpa_bwd_qkv[(num_cores,)](
+            q,
+            k,
+            v,
+            do,
+            d,
+            dq,
+            core_dk,
+            core_dv,
+            lse,
+            mask,
+            scale,
+            k.shape[1],
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            q.shape[3],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            d.stride(0),
+            d.stride(1),
+            d.stride(2),
+            limit_auto_multi_buffer_buffer="no-limit",
+            hfusion_enable_multiple_consumer_fusion=True,
+            unit_flag=True,
+            limit_auto_multi_buffer_of_local_buffer="no-l0c",
+            intra_cache_num=2,
+            inter_cache_num=2,
+            enable_vf_operand_substitution=True,
+        )
+        dk = torch.sum(core_dk, 0)
+        dv = torch.sum(core_dv, 0)
+    else:
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        kernel_sdpa_bwd_q[(num_cores,)](
+            q,
+            k,
+            v,
+            do,
+            d,
+            dq,
+            lse,
+            mask,
+            scale,
+            k.shape[1],
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            q.shape[3],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            d.stride(0),
+            d.stride(1),
+            d.stride(2),
+            limit_auto_multi_buffer_buffer="no-limit",
+            hfusion_enable_multiple_consumer_fusion=True,
+            unit_flag=True,
+            limit_auto_multi_buffer_of_local_buffer="no-l0c",
+            intra_cache_num=1,
+        )
+
+        kernel_sdpa_bwd_kv[(num_cores,)](
+            q,
+            k,
+            v,
+            do,
+            d,
+            dk,
+            dv,
+            lse,
+            mask,
+            scale,
+            k.shape[1],
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            q.shape[3],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            d.stride(0),
+            d.stride(1),
+            d.stride(2),
+            limit_auto_multi_buffer_buffer="no-limit",
+            hfusion_enable_multiple_consumer_fusion=True,
+            unit_flag=True,
+            limit_auto_multi_buffer_of_local_buffer="no-l0c",
+            intra_cache_num=3,
+            inter_cache_num=2,
+        )
+    return dq, dk.to(k.dtype), dv.to(v.dtype)
