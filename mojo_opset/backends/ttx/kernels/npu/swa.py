@@ -1960,6 +1960,7 @@ def _swa_bwd_dkdv_kernel(
         balance_ratio = 1
         gw_kv_chunks = num_kv_chunks
         tail_kv_chunk_begin = num_kv_chunks
+        last_bsz_tail_kv_chunk_begin = num_kv_chunks
         if GLOBAL_WINDOW is not None and LOCAL_WINDOW is not None:
             gw_task = tl.cdiv(q_seq_len, BLOCK_M)
             lw_task = tl.cdiv(LOCAL_WINDOW, BLOCK_M) + 1
@@ -1986,6 +1987,23 @@ def _swa_bwd_dkdv_kernel(
                     num_kv_chunks = _num_kv_chunks
                 balance_ratio = balance_ratio_
 
+        tail_balance_ratio = 1
+        if IS_CAUSAL and balance_ratio == 1:
+            last_tasks = num_kv_chunks * NUM_KV_HEADS
+            last_tail_tasks = last_tasks % n_programs
+            # if causal and tail block tasks use fewer than half the cores,
+            # sharing cores between tail block tasks and prior iteration’s trailing tasks improves performance.
+            if last_tail_tasks != 0 and last_tasks > n_programs:
+                last_tail_kv_chunks = tl.cdiv(last_tail_tasks, NUM_KV_HEADS)
+                if LOCAL_WINDOW is not None:
+                    causal_kv_chunks = tl.cdiv(LOCAL_WINDOW, BLOCK_N)
+                else:
+                    causal_kv_chunks = tl.cdiv(kv_seq_len, BLOCK_N)
+                if last_tail_kv_chunks <= causal_kv_chunks and last_tail_tasks < (n_programs // 2 - 1):
+                    num_kv_chunks -= last_tail_kv_chunks
+                    last_bsz_tail_kv_chunk_begin = num_kv_chunks - last_tail_kv_chunks
+                    tail_balance_ratio = 2
+
         prev_kv_tasks = cu_kv_chunks * NUM_KV_HEADS
         cu_kv_chunks += num_kv_chunks
         new_kv_tasks = num_kv_chunks * NUM_KV_HEADS
@@ -1994,8 +2012,10 @@ def _swa_bwd_dkdv_kernel(
             kv_head_id = kv_task_id % NUM_KV_HEADS
             is_global_task = _kv_block_id < gw_kv_chunks
             is_tail_task = _kv_block_id >= tail_kv_chunk_begin
+            is_last_bsz_tail_task = _kv_block_id >= last_bsz_tail_kv_chunk_begin
             inner_loops = tl.where(is_global_task, 1, balance_ratio)
             inner_loops = tl.where(is_tail_task, 1, inner_loops)
+            inner_loops = tl.where(is_last_bsz_tail_task, tail_balance_ratio, inner_loops)
 
             for inner_id in range(inner_loops):
                 kv_block_id = tl.where(is_global_task, _kv_block_id,
@@ -2004,6 +2024,13 @@ def _swa_bwd_dkdv_kernel(
                                        gw_kv_chunks
                                        + (tail_kv_chunk_begin - gw_kv_chunks) * balance_ratio
                                        + (_kv_block_id - tail_kv_chunk_begin),
+                                       kv_block_id)
+                kv_block_id = tl.where(is_last_bsz_tail_task,
+                                       (
+                                        last_bsz_tail_kv_chunk_begin
+                                        + (_kv_block_id - last_bsz_tail_kv_chunk_begin) * inner_loops
+                                        + inner_id
+                                       ),
                                        kv_block_id)
                 kv_block_start = kv_block_id * BLOCK_N
                 kv_block_end = min(kv_block_start + BLOCK_N, kv_seq_len)
