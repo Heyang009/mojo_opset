@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from .utils import libentry
+from ..utils import libentry
 
 from mojo_opset.backends.ttx.kernels.npu.utils import get_num_cores
 
@@ -141,9 +141,7 @@ def lightning_indexer_kernel(
             + n_idx * BLOCK_SIZE_N * key_scale_stride_n
             + offs_n * key_scale_stride_n
         )
-        k_scale = tl.load(key_scale_ptrs, mask=mask, other=0.0)
-
-        k = k * k_scale[:, None]
+        k_scale = tl.load(key_scale_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         query_ptrs = (
             query_ptr
@@ -154,7 +152,8 @@ def lightning_indexer_kernel(
         )
         q = tl.load(query_ptrs)
 
-        relu_qk = tl.maximum(tl.dot(q.to(k.dtype), tl.trans(k)), 0.0)
+        mul_qk = tl.dot(q.to(k.dtype), tl.trans(k))
+        relu_qk = tl.maximum(mul_qk, 0.0)
 
         query_scale_ptrs = (
             query_scale_ptr
@@ -162,9 +161,9 @@ def lightning_indexer_kernel(
             + m_idx * query_scale_stride_m
             + offs_h * query_scale_stride_h
         )
-        q_scale = tl.load(query_scale_ptrs)
+        q_scale = tl.load(query_scale_ptrs).to(tl.float32)
 
-        o = tl.sum(relu_qk * q_scale[:, None], axis=0)
+        o = tl.sum(relu_qk * q_scale[:, None], axis=0)  * k_scale
 
         output_ptrs = (
             output_ptr

@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 import triton
 import triton.language as tl
 
-from .utils import get_num_cores
-from .utils import is_910
+from ..utils import get_num_cores
+from ..utils import is_910
 
 AUX_MASK_SIZE = 256
 AUX_MASK = None

@@ -51,6 +51,9 @@ class TTXPagedPrefillGQA(MojoPagedPrefillGQA):
         page_size: int,
     ):
         assert get_platform() == "npu"
+        from mojo_opset.backends.ttx.kernels.npu.utils import is_910
+        if is_910():
+            return
         total_seq_lens = (
             cu_q_lens[1:] - cu_q_lens[:-1]
             if cu_total_seq_lens is None

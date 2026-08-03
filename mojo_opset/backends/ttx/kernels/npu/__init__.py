@@ -1,3 +1,5 @@
+from . import _dispatch  # noqa: F401  populates sys.modules with per-SoC dispatched kernels
+
 from .convolution import causal_conv1d_bwd_impl
 from .convolution import causal_conv1d_fwd_impl
 from .convolution import causal_conv1d_update_bdt_impl
@@ -5,6 +7,10 @@ from .diffution_attention import diffusion_attention_bwd_impl
 from .diffution_attention import diffusion_attention_fwd_impl
 from .flex_attention import flex_attention_bwd_impl
 from .flex_attention import flex_attention_fwd_impl
+from .flex_attention import _build_packed_block_mask_streaming
+from .flex_attention import create_block_mask_patched
+from .flex_attention import triton_create_mask
+from .flex_attention import MASK_BLOCK_SIZE
 from .flash_attention import paged_attention_decode_impl
 from .flash_attention import paged_attention_prefill_impl
 from .flash_attention import paged_attention_prefill_prepare
@@ -121,6 +127,10 @@ __all__ = [
     "diffusion_attention_bwd_impl",
     "flex_attention_fwd_impl",
     "flex_attention_bwd_impl",
+    "_build_packed_block_mask_streaming",
+    "create_block_mask_patched",
+    "triton_create_mask",
+    "MASK_BLOCK_SIZE",
     "m_grouped_matmul_impl",
     "k_grouped_matmul_impl",
     "store_paged_kv_impl",

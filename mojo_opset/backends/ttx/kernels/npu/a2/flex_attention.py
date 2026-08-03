@@ -6,8 +6,8 @@ import time
 import triton
 import triton.language as tl
 
-from .utils import get_num_cores
-from .utils import is_910
+from ..utils import get_num_cores
+from ..utils import is_910
 
 
 TILE_BLOCK_SIZE = 128
