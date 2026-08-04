@@ -101,6 +101,7 @@ __all__ = [
     "rmsnorm_bwd_impl",
     "rmsnorm_fwd_impl",
     "rmsnorm_infer_impl",
+    "group_rmsnorm_impl",
     "layernorm_infer_impl",
     "layernorm_bwd_impl",
     "layernorm_fwd_impl",
