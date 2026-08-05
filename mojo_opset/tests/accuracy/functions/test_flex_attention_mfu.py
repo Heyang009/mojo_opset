@@ -24,21 +24,52 @@ try:
 except Exception:
     pass
 
+
+# ============================================================================
+# Global configuration
+# ============================================================================
+DTYPE = torch.bfloat16
+HEAD_DIM = 128
+NUM_Q_HEADS = 16
+NUM_KV_HEADS = 8
+SLIDING_WINDOW = 4096
+GLOBAL_WINDOW = 2048
+
+
 GEN_MASK_TRITON = False
+
+DATA_LENGTH = [[2000, 22000, 2000], [2000, 22000, 2000]]
+DATA_INPUT_TYPE = [["text", "image_gen", "text"], ["text", "image_gen", "text"]]
 FULL_MASK_MODALITIES = ("image_gen", "image_vae")
+
+DATA_LENGTH_VIDEO = [
+    [8192],
+]
+print(f"DATA_LENGTH_VIDEO {DATA_LENGTH_VIDEO}")
+VIDEO_FRAME_LENGTH = [
+    [[8192]],
+]
+print(f"VIDEO_FRAME_LENGTH {VIDEO_FRAME_LENGTH}")
 
 SEED = 0
 APPLY_Q_CHUNK = 2048
 Q_BLOCK_SIZE = 128
 KV_BLOCK_SIZE = 128
 
+_WARMUP = 1
+_ITERS = 3
+_MB = 1024 ** 2
+
 def _device():
     return get_torch_device()
+
+
 def _sync():
     if _device() == "npu":
         torch.npu.synchronize()
     elif _device() == "cuda":
         torch.cuda.synchronize()
+
 
 # ============================================================================
 # Mask function definitions
@@ -72,6 +103,7 @@ def _stair_mask_mod(problem):
         return same_doc & frame_causal
     return mask_mod
 
+
 def _video_stair_mask_mod(problem):
     video_ids = problem["video_ids"]
     frame_ids = problem["frame_ids"]
@@ -83,6 +115,7 @@ def _video_stair_mask_mod(problem):
         return same_video & (same_frame | prev_frame)
     return mask_mod
 
+
 def _cross_sample_causal_video_bidir_mask_mod(problem):
     modality = problem["modality"]
 
@@ -92,6 +125,7 @@ def _cross_sample_causal_video_bidir_mask_mod(problem):
         same_video = is_video & (modality[q_idx] == modality[kv_idx])
         return causal | same_video
     return mask_mod
+
 
 def _full_mask_mod(problem):
     document_ids = problem["segment_ids"]
@@ -106,6 +140,7 @@ def _full_mask_mod(problem):
         return samedoc_causal | same_img
     return mask_mod
 
+
 _MASK_FUNCS = [
     ("sparse", _sparse_mask_mod),
     ("full", _full_mask_mod),
@@ -116,9 +151,11 @@ _MASK_FUNCS = [
 
 _MASK_FUNC_TO_TYPE = {id(fn): name for name, fn in _MASK_FUNCS}
 
+
 def _build_dense_mask(mask_func, problem):
     mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
     return triton_create_mask(problem, mask_type_str, tile_size=MASK_BLOCK_SIZE)
+
 
 # ============================================================================
 # Attention wrappers
@@ -132,6 +169,7 @@ def _flex_attention_mojo(q, k, v, mask, block_mask, dropout_rate=0.0, input_form
         block_mask.dense_mask = mask
     output = mojo_flex_attention(q, k, v, block_mask=block_mask)
     return output.transpose(1, 2)
+
 
 def _sdpa_with_dense_mask(query_states, key_states, value_states, attention_mask, dropout_rate, input_format):
     if input_format == "head-first":
@@ -167,15 +205,16 @@ def _sdpa_with_dense_mask(query_states, key_states, value_states, attention_mask
         )
     return torch.cat(chunks, dim=2).transpose(1, 2).contiguous()
 
+
 # ============================================================================
 # Data building
 # ============================================================================
-def _build_video_indicators(device,frame_lens):
+def _build_video_indicators(device):
     segment_ids, doc_start, video_ids, frame_ids, modality = [], [], [], [], []
     sample_start = 0
     next_video_id = 0
 
-    for sample_id, sample_videos in enumerate(frame_lens):
+    for sample_id, sample_videos in enumerate(VIDEO_FRAME_LENGTH):
         for frame_lens in sample_videos:
             cur_video_id = next_video_id
             next_video_id += 1
@@ -195,7 +234,14 @@ def _build_video_indicators(device,frame_lens):
         "modality": torch.cat(modality).to(device),
     }
 
+
 def _build_modality_indicators(device, data_length=None, data_input_type=None, image_modalities=None):
+    if data_length is None:
+        data_length = DATA_LENGTH
+    if data_input_type is None:
+        data_input_type = DATA_INPUT_TYPE
+    if image_modalities is None:
+        image_modalities = FULL_MASK_MODALITIES
     indicator = []
     iidx = 1
     for sample_types, sample_lens in zip(data_input_type, data_length):
@@ -207,14 +253,18 @@ def _build_modality_indicators(device, data_length=None, data_input_type=None, i
                 indicator.append(torch.full((sample_len,), -1, dtype=torch.long))
     return torch.cat(indicator).to(device)
 
-def build_problem(batch_size,q_head, kv_head, head_dim, data_lens, data_types, sliding_windows, global_windows, dtype, mask_func):
+
+def build_problem(mask_mod):
     device = _device()
     torch.manual_seed(SEED)
+    local_data_len = DATA_LENGTH
+    if mask_mod in [_video_stair_mask_mod, _stair_mask_mod]:
+        local_data_len = DATA_LENGTH_VIDEO
 
-    num_q_heads = q_head
-    num_kv_heads = kv_head
+    num_q_heads = NUM_Q_HEADS
+    num_kv_heads = NUM_KV_HEADS
 
-    sample_lens = [sum(s) for s in data_lens]
+    sample_lens = [sum(s) for s in local_data_len]
     cu_seqlens = torch.tensor([0, *torch.tensor(sample_lens).cumsum(0).tolist()], dtype=torch.int32, device=device)
     total_s = int(cu_seqlens[-1].item())
     segment_ids = torch.repeat_interleave(
@@ -223,29 +273,28 @@ def build_problem(batch_size,q_head, kv_head, head_dim, data_lens, data_types, s
     )
     doc_start = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens.diff()).to(torch.long)
 
-    q = torch.rand(batch_size, num_q_heads, total_s, head_dim, device=device, dtype=dtype)
-    k = torch.rand(batch_size, num_kv_heads, total_s, head_dim, device=device, dtype=dtype)
-    v = torch.rand(batch_size, num_kv_heads, total_s, head_dim, device=device, dtype=dtype)
+    q = torch.rand(1, num_q_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
+    k = torch.rand(1, num_kv_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
+    v = torch.rand(1, num_kv_heads, total_s, HEAD_DIM, device=device, dtype=DTYPE)
 
-    if mask_func in [_video_stair_mask_mod, _stair_mask_mod]:
-        meta = _build_video_indicators(device,data_types)
+    if mask_mod in [_video_stair_mask_mod, _stair_mask_mod]:
+        meta = _build_video_indicators(device=device)
         return {
             "q": q, "k": k, "v": v,
             "segment_ids": meta["segment_ids"], "doc_start": meta["doc_start"],
             "video_ids": meta["video_ids"], "frame_ids": meta["frame_ids"], "modality": meta["modality"],
             "cu_seqlens": cu_seqlens, "total_s": total_s,
-            "sliding_window": sliding_windows, "global_window": global_windows,
-            "num_q_heads": num_q_heads, "num_kv_heads": num_kv_heads, "head_dim": head_dim,
+            "sliding_window": SLIDING_WINDOW, "global_window": GLOBAL_WINDOW,
+            "num_q_heads": num_q_heads, "num_kv_heads": num_kv_heads, "head_dim": HEAD_DIM,
         }
     else:
-        modality = _build_modality_indicators(device=device,data_length=data_lens, 
-                                              data_input_type=data_types, image_modalities=FULL_MASK_MODALITIES,)
+        modality = _build_modality_indicators(device=device)
         return {
             "q": q, "k": k, "v": v,
             "segment_ids": segment_ids.long(), "modality": modality, "doc_start": doc_start,
             "cu_seqlens": cu_seqlens, "total_s": total_s,
-            "sliding_window": sliding_windows, "global_window": global_windows,
-            "num_q_heads": num_q_heads, "num_kv_heads": num_kv_heads, "head_dim": head_dim,
+            "sliding_window": SLIDING_WINDOW, "global_window": GLOBAL_WINDOW,
+            "num_q_heads": num_q_heads, "num_kv_heads": num_kv_heads, "head_dim": HEAD_DIM,
         }
 
 
@@ -258,34 +307,15 @@ _mask_func_param = pytest.mark.parametrize(
     ids=[name for name, _ in _MASK_FUNCS],
 )
 
-@pytest.mark.parametrize(
-    "batch_size,q_head, kv_head, head_dim, data_lens, data_types, sliding_windows, global_windows, dtype, mask_func,",
-    [     
-        pytest.param(1, 16, 8, 128, [[2000, 22000, 2000], [2000, 22000, 2000]],[["text", "image_gen", "text"], 
-            ["text", "image_gen", "text"]], 1024, 4, torch.bfloat16, _sparse_mask_mod,id="sparse_2000_22000"), 
 
-        pytest.param(1, 16, 8, 128, [[2000, 22000, 2000], [2000, 22000, 2000]],[["text", "image_gen", "text"], 
-                    ["text", "image_gen", "text"]], 1024, 4, torch.bfloat16, _full_mask_mod,id="full_2000_22000"), 
-
-        pytest.param(1, 16, 8, 128, [[2000, 22000, 2000], [2000, 22000, 2000]],[["text", "image_gen", "text"], 
-                            ["text", "image_gen", "text"]], 1024, 4, torch.bfloat16, _cross_sample_causal_video_bidir_mask_mod,id="cross_2000_22000"), 
-
-        pytest.param(1, 16, 8, 128, [[6500, 6500, 6500, 6500], [6500, 6500, 6500, 6500]],[
-                        [[3000, 2000, 1500], [4000, 2500], [1500, 1500, 1500, 2000], [6500]],
-                        [[3500, 3000], [1000, 2000, 1500, 2000], [2000, 2500, 2000], [6500]],]
-                    , 1024, 4, torch.bfloat16, _video_stair_mask_mod,id="video_stair_6500"), 
-
-        pytest.param(1, 16, 8, 128, [[6500, 6500, 6500, 6500], [6500, 6500, 6500, 6500]],[
-                        [[3000, 2000, 1500], [4000, 2500], [1500, 1500, 1500, 2000], [6500]],
-                        [[3500, 3000], [1000, 2000, 1500, 2000], [2000, 2500, 2000], [6500]],], 1024, 4, torch.bfloat16, _stair_mask_mod,id="stair_6500"), 
-      
-    ]
-   
-)
+# ============================================================================
+# Test cases
+# ============================================================================
+@_mask_func_param
 @pytest.mark.skipif(get_platform() != "npu", reason="FlexAttention TTX backend requires NPU")
 @bypass_not_implemented
-def test_flex_attention(batch_size,q_head, kv_head, head_dim, data_lens, data_types, sliding_windows, global_windows, dtype, mask_func):
-    problem = build_problem(batch_size,q_head, kv_head, head_dim, data_lens, data_types, sliding_windows, global_windows, dtype, mask_func)
+def test_flex_attention(mask_func):
+    problem = build_problem(mask_func)
 
     q_base = problem["q"]
     k_base = problem["k"]
@@ -312,15 +342,16 @@ def test_flex_attention(batch_size,q_head, kv_head, head_dim, data_lens, data_ty
         )
     _sync()
 
-    return_grid = torch.tensor(SEQ_LEN, dtype=dtype, device=torch.device(_device()))
+    return_grid = torch.tensor(SEQ_LEN, dtype=DTYPE, device=torch.device(_device()))
 
     mojo_output = _flex_attention_mojo(q_mojo, k_mojo, v_mojo, None, packed_block_mask, 0.0, None)
     _sync()
 
     dense_mask = _build_dense_mask(mask_func, problem)
     _sync()
-    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>dense_mask.sum().item()", dense_mask.to("cpu").sum().item())
-
+    n_element=dense_mask.to("cpu").sum().item()
+    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>dense_mask.sum().item()", n_element)
+    
     ref_output = _sdpa_with_dense_mask(q_ref, k_ref, v_ref, dense_mask, 0.0, None)
     _sync()
 
@@ -338,6 +369,235 @@ def test_flex_attention(batch_size,q_head, kv_head, head_dim, data_lens, data_ty
     torch.testing.assert_close(k_mojo.grad.cpu(), k_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(v_mojo.grad.cpu(), v_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
 
+
+# ============================================================================
+# Performance benchmark (torch_npu.profiler based)
+# ============================================================================
+def _perf_benchmark(label, build_mask_fn, fwd_fn, q, k, v, prof_dir_root, mask_func,n_element):
+    import torch_npu
+
+    q = q.detach().requires_grad_(True)
+    k = k.detach().requires_grad_(True)
+    v = v.detach().requires_grad_(True)
+
+    return_grid = torch.tensor(520000, dtype=DTYPE, device=torch.device(_device()))
+
+    # mask build measurement: peak + stable
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+    _sync()
+    mask = build_mask_fn()
+    mask_peak = torch.npu.max_memory_allocated() / _MB
+    torch.npu.empty_cache()
+    gc.collect()
+    _sync()
+    mask_mem = torch.npu.memory_allocated() / _MB
+
+    # fwd measurement (includes grad graph)
+    torch.npu.reset_peak_memory_stats()
+    _sync()
+    out = fwd_fn(q, k, v, mask)
+    _sync()
+    fwd_mem = torch.npu.max_memory_allocated() / _MB
+
+    # bwd measurement
+    torch.npu.reset_peak_memory_stats()
+    _sync()
+    out.float().mean().backward(return_grid)
+    _sync()
+    bwd_mem = torch.npu.max_memory_allocated() / _MB
+
+    q.grad = k.grad = v.grad = None
+    peak_mem = max(fwd_mem, bwd_mem)
+    print(f"[{label}] mask: {mask_mem:.1f}MB(peak:{mask_peak:.1f}MB), fwd_mem: {fwd_mem:.1f}MB, bwd_mem: {bwd_mem:.1f}MB, peak: {peak_mem:.1f}MB")
+
+    # ===== torch_npu.profiler based timing =====
+    prof_dir = os.path.join(prof_dir_root, label)
+    os.makedirs(prof_dir, exist_ok=True)
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        l2_cache=False,
+    )
+
+    print(f"\n======================== prof begin ({label}) ====================")
+    with torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.NPU],
+        with_stack=False,
+        record_shapes=False,
+        profile_memory=False,
+        schedule=torch_npu.profiler.schedule(
+            wait=1, warmup=1, active=10, repeat=1, skip_first=1
+        ),
+        experimental_config=experimental_config,
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(prof_dir),
+    ) as prof:
+        for i in range(12):
+            # 重新构造数据，避免L2 Cache影响
+            problem = build_problem(mask_func)
+            q = problem["q"].detach().clone().requires_grad_(True)
+            k = problem["k"].detach().clone().requires_grad_(True)
+            v = problem["v"].detach().clone().requires_grad_(True)
+
+            out = fwd_fn(q, k, v, mask)
+            _sync()
+
+            # 插入其他算子，重置L2 Cache, 112M，总访存224MB覆盖112MB L2, 模拟整网调用场景
+            for j in range(5):
+                a = torch.randn(19573419, dtype=torch.float32, device="cpu").to(q.device)
+                b = torch.randn(19573419, dtype=torch.float32, device="cpu").to(q.device)
+                c = a + b       # 冲刷全部L2
+            _sync()
+
+            out.float().mean().backward(return_grid)
+            _sync()
+            prof.step()
+    print(f"======================== prof end ({label}) ====================")
+    if n_element is not None and os.path.exists(prof_dir):
+        kernel_profiling_path = max(
+            [
+                os.path.join(prof_dir, d)
+                for d in os.listdir(prof_dir)
+                if os.path.isdir(os.path.join(prof_dir, d))
+            ],
+            key=os.path.getmtime,
+        )
+        csv_file_path = os.path.join(kernel_profiling_path, "ASCEND_PROFILER_OUTPUT", "op_statistic.csv")
+
+        if os.path.exists(csv_file_path):
+            kernel_times = {}
+            with open(csv_file_path, mode="r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    kernel_name = row["OP Type"]
+                    for target in [
+                        "flex_attention_backward_dkdv_kernel_tasklist",
+                        "flex_attention_backward_dkdv_kernel",
+                        "flex_attention_backward_dq_kernel",
+                        "flex_attention_kernel",
+                    ]:
+                        if target in kernel_name:
+                            kernel_times[target] = float(row["Avg Time(us)"])
+                            break
+
+            active_steps = 5
+            peak_tflops = 378.0
+
+            num_n_elements = {
+                "flex_attention_backward_dkdv_kernel_tasklist": 8,
+                "flex_attention_backward_dkdv_kernel": 8,
+                "flex_attention_backward_dq_kernel": 6,
+                "flex_attention_kernel":4,
+            }
+
+            effective_qk_flops = NUM_Q_HEADS * n_element * HEAD_DIM
+
+            print(f"\n{'='*70}")
+            print(f"[Tasklist Perf] Hq={NUM_Q_HEADS}, Hkv={NUM_KV_HEADS}, SEQ_LEN={q.shape}")
+            print(f"[Tasklist Perf] D={HEAD_DIM}, Peak={peak_tflops} TFLOPs")
+            print(f"{'='*70}")
+
+            for kernel_name, num_n_element in num_n_elements.items():
+                if kernel_name not in kernel_times:
+                    print(f"[Tasklist Perf] {kernel_name}: not found in op_statistic.csv")
+                    continue
+                avg_time_us = kernel_times[kernel_name]
+                duration_s = avg_time_us / 1e6
+                effective_flops = effective_qk_flops * num_n_element
+                total_flops_t = effective_flops / 1e12
+                mfu = total_flops_t / duration_s / peak_tflops
+                print(
+                    f"[Tasklist Perf] {kernel_name}: "
+                    f"Avg Time={avg_time_us:.2f} us, "
+                    f"num_n_element={num_n_element}, "
+                    f"FLOPs={total_flops_t:.4f} T, "
+                    f"MFU={mfu:.4f} ({mfu*100:.2f}%)"
+                )
+            print(f"{'='*70}\n")
+        else:
+            print(f"[Tasklist Perf] op_statistic.csv not found at: {csv_file_path}")
+    else:
+        print(f"[Tasklist Perf] Profiling directory not found: {prof_dir}")
+    del out, mask
+    torch.npu.empty_cache()
+    return {"mask_mem_mb": mask_mem, "mask_peak_mb": mask_peak,
+            "fwd_mem_mb": fwd_mem, "bwd_mem_mb": bwd_mem,
+            "peak_mem_mb": peak_mem}
+
+
+def _perf_flex_attention(mask_func, problem=None):
+    if problem is None:
+        problem = build_problem(mask_func)
+    SEQ_LEN = problem["total_s"]
+    mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
+
+    prof_dir_root = os.path.join("./prof_dir", mask_type_str)
+    os.makedirs(prof_dir_root, exist_ok=True)
+
+    results = {}
+
+    # mojo_packed: streaming stripe build (no full dense_mask materialized)
+    gc.collect()
+    torch.npu.empty_cache()
+
+    def _build_packed_mask():
+        if GEN_MASK_TRITON:
+            classify_strategy= "fused" if not is_910() else "decoupled"
+            mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
+            pbm = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+        else:
+            pbm = create_block_mask_patched(
+                mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
+                device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+            )
+
+        torch.npu.empty_cache()
+        return pbm
+    dense_mask = _build_dense_mask(mask_func, problem)
+    _sync()
+    n_element=dense_mask.to("cpu").sum().item()
+    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>dense_mask.sum().item() in perf", n_element)
+    results["mojo_packed"] = _perf_benchmark(
+        "mojo_packed",
+        _build_packed_mask,
+        lambda q, k, v, bm: _flex_attention_mojo(q, k, v, None, bm, 0.0, None),
+        problem["q"], problem["k"], problem["v"],
+        prof_dir_root,
+        mask_func,
+        n_element,
+    )
+
+    # ascendc: torch SDPA + dense_mask
+    gc.collect()
+    torch.npu.empty_cache()
+
+    results["ascendc"] = _perf_benchmark(
+        "ascendc",
+        lambda: _build_dense_mask(mask_func, problem),
+        lambda q, k, v, m: _sdpa_with_dense_mask(q, k, v, m, 0.0, None),
+        problem["q"], problem["k"], problem["v"],
+        prof_dir_root,
+        mask_func,
+        None
+    )
+    return results
+
+
+@_mask_func_param
+@pytest.mark.skipif(get_platform() != "npu", reason="FlexAttention TTX backend requires NPU")
+def test_flex_attention_perf(mask_func):
+    problem = build_problem(mask_func)
+    results = _perf_flex_attention(mask_func, problem)
+    print(f"\n{'=' * 60}")
+    print(f"Performance results for {_MASK_FUNC_TO_TYPE[id(mask_func)]}:")
+    for label, r in results.items():
+        print(f"  [{label}] mask: {r['mask_mem_mb']:.1f}MB(peak:{r['mask_peak_mb']:.1f}MB), "
+              f"fwd_mem: {r['fwd_mem_mb']:.1f}MB, bwd_mem: {r['bwd_mem_mb']:.1f}MB, "
+              f"peak: {r['peak_mem_mb']:.1f}MB")
+    print(f"{'=' * 60}")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -349,6 +609,7 @@ if __name__ == "__main__":
             print(f"Testing: {n}")
             print(f"{'=' * 60}")
             test_flex_attention(fn)
+            test_flex_attention_perf(fn)
     else:
         test_flex_attention(mask_map[name])
-
+        test_flex_attention_perf(mask_map[name])
