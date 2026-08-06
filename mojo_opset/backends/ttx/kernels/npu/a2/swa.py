@@ -1902,9 +1902,9 @@ def _sdpa_single_block_bwd_dq(
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": BM, "BLOCK_N": BN, "multibuffer": MF})
-        for BM in ([128] if not is_910() else [64, 128])
-        for BN in ([128] if not is_910() else [64, 128])
-        for MF in [False, True]
+        for BM in ([128] if not is_910() else [128])
+        for BN in ([128] if not is_910() else [64])
+        for MF in ([False, True] if not is_910() else [False])
     ],
     key=["HEAD_DIM"],
 )
