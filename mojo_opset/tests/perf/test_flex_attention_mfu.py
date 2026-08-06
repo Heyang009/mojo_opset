@@ -17,7 +17,7 @@ from mojo_opset.tests.accuracy.functions.test_flex_attention import _device
 from mojo_opset.tests.accuracy.functions.test_flex_attention import _MASK_FUNC_TO_TYPE,GEN_MASK_TRITON
 from mojo_opset.tests.accuracy.functions.test_flex_attention import Q_BLOCK_SIZE, KV_BLOCK_SIZE
 from mojo_opset.tests.accuracy.functions.test_flex_attention import _build_dense_mask,_sdpa_with_dense_mask
-from mojo_opset.tests.accuracy.functions.test_flex_attention import _flex_attention_mojo
+from mojo_opset.tests.accuracy.functions.test_flex_attention import _flex_attention_mojo,_build_block_mask
 from mojo_opset.tests.accuracy.functions.test_flex_attention import _sparse_mask_mod ,_full_mask_mod
 from mojo_opset.tests.accuracy.functions.test_flex_attention import _cross_sample_causal_video_bidir_mask_mod
 from mojo_opset.tests.accuracy.functions.test_flex_attention import _video_stair_mask_mod ,_stair_mask_mod ,build_problem
@@ -200,27 +200,13 @@ def _perf_flex_attention(mask_func, problem=None):
     # mojo_packed: streaming stripe build (no full dense_mask materialized)
     gc.collect()
     torch.npu.empty_cache()
-
-    def _build_packed_mask():
-        if GEN_MASK_TRITON:
-            classify_strategy= "fused" if not is_910() else "decoupled"
-            mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
-            pbm = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
-        else:
-            pbm = create_block_mask_patched(
-                mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
-                device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
-            )
-
-        torch.npu.empty_cache()
-        return pbm
     dense_mask = _build_dense_mask(mask_func, problem)
     _sync()
     n_element=dense_mask.to("cpu").sum().item()
     print(">>>>>>>>>>>>>>>>>>>>>>>>>>>dense_mask.sum().item() in perf", n_element)
     results["mojo_packed"] = _perf_benchmark(
         "mojo_packed",
-        _build_packed_mask,
+        lambda: _build_block_mask(mask_func,problem),
         lambda q, k, v, bm: _flex_attention_mojo(q, k, v, None, bm, 0.0, None),
         problem["q"], problem["k"], problem["v"],
         prof_dir_root,

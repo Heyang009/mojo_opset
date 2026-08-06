@@ -1,7 +1,3 @@
-import csv
-import gc
-import os
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,6 +11,8 @@ from mojo_opset.backends.ttx.kernels.npu.flex_attention import _build_packed_blo
 from mojo_opset.backends.ttx.kernels.npu.flex_attention import create_block_mask_patched
 from mojo_opset.backends.ttx.kernels.npu.flex_attention import triton_create_mask
 from mojo_opset.backends.ttx.kernels.npu.flex_attention import MASK_BLOCK_SIZE
+from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
 
 
 # NPU device validation monkey-patch (same as original test)
@@ -25,6 +23,7 @@ except Exception:
     pass
 
 GEN_MASK_TRITON = False
+USE_MOJO_FLEX_ATTENTION = True
 FULL_MASK_MODALITIES = ("image_gen", "image_vae")
 
 SEED = 0
@@ -130,8 +129,37 @@ def _flex_attention_mojo(q, k, v, mask, block_mask, dropout_rate=0.0, input_form
         v = v.transpose(1, 2)
     if mask is not None:
         block_mask.dense_mask = mask
-    output = mojo_flex_attention(q, k, v, block_mask=block_mask)
+    if USE_MOJO_FLEX_ATTENTION:
+        output = mojo_flex_attention(q, k, v, block_mask=block_mask)
+    else:
+        try:
+            import torch_npu  
+            import torch_npu._inductor  # noqa: F401
+        except ImportError as e:
+            print(f"import torch_npu._inductor {e}")
+            pass
+        flex_compiled = torch.compile(flex_attention, backend="inductor")
+        output = flex_compiled(q, k, v, block_mask=block_mask,
+                               enable_gqa=True, return_lse=False)                            
     return output.transpose(1, 2)
+
+def _build_block_mask(mask_func, problem):
+    SEQ_LEN = problem["total_s"]
+    device=problem["q"].device
+    if GEN_MASK_TRITON:
+        classify_strategy= "fused" if not is_910() else "decoupled"
+        mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
+        packed_block_mask = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
+    else:
+        if USE_MOJO_FLEX_ATTENTION:
+            packed_block_mask = create_block_mask_patched(
+                mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
+                device=device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+            )
+        else:
+            packed_block_mask = create_block_mask(mask_func(problem),B=1, H=1, Q_LEN=SEQ_LEN, 
+                KV_LEN=SEQ_LEN,device=device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE))
+    return packed_block_mask
 
 def _sdpa_with_dense_mask(query_states, key_states, value_states, attention_mask, dropout_rate, input_format):
     if input_format == "head-first":
@@ -301,15 +329,8 @@ def test_flex_attention(batch_size,q_head, kv_head, head_dim, data_lens, data_ty
 
     SEQ_LEN = problem["total_s"]
 
-    if GEN_MASK_TRITON:
-        classify_strategy= "fused" if not is_910() else "decoupled"
-        mask_type_str = _MASK_FUNC_TO_TYPE[id(mask_func)]
-        packed_block_mask = _build_packed_block_mask_streaming(mask_type_str, problem, SEQ_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, classify_strategy=classify_strategy)
-    else:
-        packed_block_mask = create_block_mask_patched(
-            mask_func(problem), B=1, H=1, Q_LEN=SEQ_LEN, KV_LEN=SEQ_LEN,
-            device=problem["q"].device, BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
-        )
+    packed_block_mask = _build_block_mask(mask_func, problem)
+                                                  
     _sync()
 
     return_grid = torch.tensor(SEQ_LEN, dtype=dtype, device=torch.device(_device()))
@@ -337,6 +358,8 @@ def test_flex_attention(batch_size,q_head, kv_head, head_dim, data_lens, data_ty
     torch.testing.assert_close(q_mojo.grad.cpu(), q_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(k_mojo.grad.cpu(), k_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
     torch.testing.assert_close(v_mojo.grad.cpu(), v_ref.grad.cpu(), atol=5e-3, rtol=5e-3)
+
+
 
 if __name__ == "__main__":
     import sys
