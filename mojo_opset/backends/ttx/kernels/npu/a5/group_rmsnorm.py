@@ -6,9 +6,9 @@ from triton.runtime.libentry import libentry
 
 from mojo_opset.backends.ttx.kernels.npu.utils import VEC_ALIGN_BYTES
 from mojo_opset.backends.ttx.kernels.utils import align
-from mojo_opset.backends.ttx.kernels.npu.rmsnorm import COL_BLOCKING_THRESHOLD
-from mojo_opset.backends.ttx.kernels.npu.rmsnorm import rms_norm_fwd_heuristics
-from mojo_opset.backends.ttx.kernels.npu.rmsnorm import rmsnorm_infer_impl
+from .rmsnorm import COL_BLOCKING_THRESHOLD
+from .rmsnorm import rms_norm_fwd_heuristics
+from .rmsnorm import rmsnorm_infer_impl
 
 
 @libentry()
