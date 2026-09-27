@@ -10,9 +10,10 @@ from ..utils import is_910
 AUX_MASK_SIZE = 256
 AUX_MASK = None
 
-# 大窗口压缩模板参数：LW 超过 COMPRESS_CAP 时（不论 GW 大小），模板按 (GW, CAP)
-# 生成（仅 LW 折叠），kernel 侧按边界对齐映射读取。模板宽度为 GW + CAP + 4*TILE，
-# GW <= 768 时总尺寸不超过 (2048, 2048)；GW 更大时映射仍正确但显存随 GW 增长。
+# Mask 模板压缩：LW > COMPRESS_CAP 时，模板 local 窗口宽度固定为 COMPRESS_CAP，
+# 内存从 O((GW+LW)^2) 降为 O((GW+CAP)^2)。kernel 侧通过 6 类边界对齐映射读取。
+# COMPRESS_CAP >= 2*max_tile 保证斜边界与主对角线不在同一 tile（正确性约束）。
+# 详见 docs/swa_mask_template_compress_design.md
 COMPRESS_CAP = 512
 COMPRESS_TILE = 128
 
@@ -82,26 +83,35 @@ def get_mask_causal_with_window(
         global_window_size = 0
 
     if local_window_size > COMPRESS_CAP:
+        # 压缩模板：local 窗口宽度固定为 512，模板尺寸仅依赖 GW，与 LW 无关。
+        # 模板布局（S = GW + 1024）：
+        #   n=0      GW     GW+512        GW+1024=S
+        #   +--------+--------+-------------+
+        # m=0| sink  |  dead  |   padding   |
+        #    +--------+        |   (全False) |
+        # GW |  causal下三角  |  local(宽512)|             |
+        # S  +--------+--------+-------------+
+        #    |         AUX padding (256行)   |
+        #    +------------------------------+
         assert BLOCK_M <= COMPRESS_TILE and BLOCK_N <= COMPRESS_TILE, (
             f"compressed mask requires BLOCK_M/BLOCK_N <= {COMPRESS_TILE}, got {BLOCK_M}/{BLOCK_N}"
         )
         mask_gw = global_window_size
         mask_lw = COMPRESS_CAP
-        M = mask_gw + mask_lw + 4 * COMPRESS_TILE
+        M = mask_gw + mask_lw + 4 * COMPRESS_TILE   # GW + 1024
         N = mask_gw + mask_lw + 4 * COMPRESS_TILE
     else:
+        # 未压缩模板：精确反映真实 (GW, LW) mask
         mask_gw = global_window_size
         mask_lw = local_window_size
         M = (global_window_size + local_window_size + 4 * max(BLOCK_M, BLOCK_N) + BLOCK_M - 1) // BLOCK_M * BLOCK_M
         N = (global_window_size + local_window_size + 5 * max(BLOCK_M, BLOCK_N) + BLOCK_N - 1) // BLOCK_N * BLOCK_N
 
+    # mask[m,n] = (n <= m) & (n < GW | n >= m - LW')，压缩时 LW'=512
     causal = torch.ones(M, N, dtype=torch.bool).tril()
-
     sink_band = torch.zeros(M, N, dtype=torch.bool)
     sink_band[:, :mask_gw] = True
-
     local_band = torch.ones(M, N, dtype=torch.bool).triu(diagonal=-mask_lw)
-
     mask = causal & (sink_band | local_band)
 
     M_boundary = M + AUX_MASK_SIZE
@@ -120,7 +130,10 @@ def get_mask_causal_with_window(
 
 @triton.jit
 def gen_mask_causal_with_window(mask_ptr_causal, mask_size_m, mask_size_n, M_BLOCK, N_BLOCK, m_start, n_start,
-                                global_window_size, local_windows_size, q_seq_len, kv_seq_len, AUX_MASK_SIZE=AUX_MASK_SIZE):
+                                global_window_size, local_windows_size, q_seq_len, kv_seq_len,
+                                AUX_MASK_SIZE: tl.constexpr = AUX_MASK_SIZE,
+                                COMPRESS_CAP: tl.constexpr = 512,
+                                COMPRESS_TILE: tl.constexpr = 128):
     if local_windows_size is None:
         local_windows_size = 0
     if global_window_size is None:
@@ -141,25 +154,29 @@ def gen_mask_causal_with_window(mask_ptr_causal, mask_size_m, mask_size_n, M_BLO
         need_adjust = need_adjust * ((1 - is_global_block) + is_global_block * can_compensate)
         n_pos = ((1 - need_adjust) * n_start + need_adjust * max(global_window_size + 1, n_start - shift)) * (1 - is_q_oob)
     else:
-        # 仅 LW 压缩（LW > CAP，模板在 GW 维度精确，LW' = CAP = 512，对任意 GW 成立）：
-        # LW' = 512 >= 2*TILE 保证模板 local 带覆盖 tile 内任意对角偏移，causal 类 tile
-        # 可直读绝对坐标；竖直边界与绝对位置重合，跨 GW 的 tile 只需 m 方向钳位或
-        # lw_shift 行修正。映射分类见 docs/swa_mask_template_compress_design.md。
-        lwp = COMPRESS_CAP
-        RT = global_window_size + lwp + 2 * COMPRESS_TILE
-        lw_shift = local_windows_size - lwp
+        # LW 压缩分支（LW > 512）：模板按 (GW, 512) 生成，kernel 侧按 tile 相对
+        # 三条边界（竖直 n=GW、斜 n=m-LW、主对角 n=m）的位置分 6 类（A~F）映射读取。
+        # 不变式：mask 图案沿对角线平移不变；tile≤128 且 LW'=512≥2×128，
+        # 斜边界与主对角线不在同一 tile。详见 docs/swa_mask_template_compress_design.md
 
-        d = m_start - n_start
-        dv = global_window_size - n_start
-        db = d - local_windows_size
+        lwp = COMPRESS_CAP                              # 模板 local 窗口宽 512
+        RT = global_window_size + lwp + 2 * COMPRESS_TILE  # 全 True 块锚点行
+        lw_shift = local_windows_size - lwp              # LW 压缩差值，行方向补偿
 
-        in_sink = (dv > N_BLOCK - 1).to(tl.int32)
-        lt_gw = (dv > 0).to(tl.int32)
-        below = (d >= N_BLOCK - 1).to(tl.int32)
+        d  = m_start - n_start                           # 对角偏移 m-n
+        dv = global_window_size - n_start                # 到 GW 竖直边界距离
+        db = d - local_windows_size                      # 到斜边界距离
+
+        # 6 个边界标志（互斥划分 6 类 tile）
+        in_sink    = (dv > N_BLOCK - 1).to(tl.int32)
+        lt_gw      = (dv > 0).to(tl.int32)
+        below      = (d >= N_BLOCK - 1).to(tl.int32)
         band_right = (db > N_BLOCK - 1).to(tl.int32)
-        band_left = (db <= -(M_BLOCK - 1)).to(tl.int32)
-        l2b_cond = (db <= dv - (M_BLOCK - 1)).to(tl.int32)
+        band_left  = (db <= -(M_BLOCK - 1)).to(tl.int32)
+        l2b_cond   = (db <= dv - (M_BLOCK - 1)).to(tl.int32)
 
+        # 6 类 one-hot：A=纯sink/直读, B=跨GW, C=local对角块, D=斜边界穿过,
+        #               E=全True, F=全dead
         cross = lt_gw - in_sink
         zone = 1 - lt_gw
         m_clamp = min(m_start, actual_mask_m - M_BLOCK)
@@ -177,15 +194,16 @@ def gen_mask_causal_with_window(mask_ptr_causal, mask_size_m, mask_size_n, M_BLO
         cD = c_z - cCD
         cE = cE1 + cE2
 
+        # n_pos: A/B 直读, C→GW+512, D→GW+128, E→右下全True, F→padding(全False)
         g_ab = cA + cB
         n_pos = (n_start * g_ab + (global_window_size + lwp) * cC
                  + (global_window_size + COMPRESS_TILE) * cD
                  + (RT - (N_BLOCK - 1)) * cE)
 
+        # m_pos: A→钳位, B→上移lw_shift, C/D→对角平移(d+n_pos), D额外减lw_shift,
+        #        E→RT, F→padding行
         g_dnl = cB + cC + cD
         g_lws = cB + cD
-        # 调用方保证 m_start < kv_seq_len（6 个 kernel 的 m_start = q_block_start +
-        # kv_computed_len 恒小于 kv_seq_len），压缩分支无需 OOB 兜底。
         m_pos = (m_clamp * cA + (d + n_pos) * g_dnl - lw_shift * g_lws
                  + RT * cE + actual_mask_m * c_dead)
 
